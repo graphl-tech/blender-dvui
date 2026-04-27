@@ -212,6 +212,65 @@ export fn dvui_cursor_over_floating(ctx: *Ctx) c_int {
     return if (ctx.window.cursorRequestedFloating() != null) 1 else 0;
 }
 
+/// Tell DVUI that text from `start` to `end` should be selected in the
+/// currently focused widget. `start` and `end` are byte offsets.
+export fn dvui_event_text_select(ctx: *Ctx, start: u32, end: u32) c_int {
+    const handled = ctx.window.addEventTextSelect(.{
+        .start = @intCast(start),
+        .end = @intCast(end),
+    }) catch return 0;
+    return if (handled) 1 else 0;
+}
+
+/// Focus the dvui widget under (`x`, `y`) without moving the mouse
+/// position. Use to forward an OS-level "click to focus" signal.
+/// `button` follows the same mapping as `dvui_event_mouse_button` but
+/// may also be -1 (no button, just a focus event).
+export fn dvui_event_focus(ctx: *Ctx, x: f32, y: f32, button: c_int) c_int {
+    const b: dvui.enums.Button = if (button < 0)
+        .none
+    else
+        mapMouseButton(button) orelse .none;
+    const handled = ctx.window.addEventFocus(.{
+        .pt = .{ .x = x, .y = y },
+        .button = b,
+    }) catch return 0;
+    return if (handled) 1 else 0;
+}
+
+/// Notify DVUI that the host window is closing.
+export fn dvui_event_window_close(ctx: *Ctx) void {
+    ctx.window.addEventWindow(.{ .action = .close }) catch {};
+}
+
+/// Notify DVUI that the host application is quitting.
+export fn dvui_event_app_quit(ctx: *Ctx) void {
+    ctx.window.addEventApp(.{ .action = .quit }) catch {};
+}
+
+/// Forward a touch / stylus motion event. Coordinates are normalized to
+/// `[0, 1]` over the area; `dx`/`dy` are normalized deltas. `finger`
+/// is a touch slot id (0..3) — passed through to dvui via
+/// `enums.Button.touch0..touch3`.
+export fn dvui_event_touch_motion(
+    ctx: *Ctx,
+    finger: c_int,
+    x: f32,
+    y: f32,
+    dx: f32,
+    dy: f32,
+) c_int {
+    const f: dvui.enums.Button = switch (finger) {
+        0 => .touch0,
+        1 => .touch1,
+        2 => .touch2,
+        3 => .touch3,
+        else => return 0,
+    };
+    const handled = ctx.window.addEventTouchMotion(f, x, y, dx, dy) catch return 0;
+    return if (handled) 1 else 0;
+}
+
 export fn dvui_frame(ctx: *Ctx) c_int {
     ctx.window.begin(std.time.nanoTimestamp()) catch return -1;
     app.frame() catch return -2;

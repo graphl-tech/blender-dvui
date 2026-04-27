@@ -174,7 +174,16 @@ def _bind(lib: C.CDLL) -> None:
     s("dvui_event_mouse_button", [C.c_void_p, C.c_int, C.c_int], C.c_int)
     s("dvui_event_mouse_wheel", [C.c_void_p, C.c_float, C.c_float], C.c_int)
     s("dvui_event_text", [C.c_void_p, C.c_char_p, C.c_uint32], C.c_int)
+    s("dvui_event_text_select", [C.c_void_p, C.c_uint32, C.c_uint32], C.c_int)
     s("dvui_event_key", [C.c_void_p, C.c_int, C.c_int, C.c_int], C.c_int)
+    s("dvui_event_focus", [C.c_void_p, C.c_float, C.c_float, C.c_int], C.c_int)
+    s(
+        "dvui_event_touch_motion",
+        [C.c_void_p, C.c_int, C.c_float, C.c_float, C.c_float, C.c_float],
+        C.c_int,
+    )
+    s("dvui_event_window_close", [C.c_void_p], None)
+    s("dvui_event_app_quit", [C.c_void_p], None)
     s("dvui_cursor_over_floating", [C.c_void_p], C.c_int)
 
     s("dvui_frame", [C.c_void_p], C.c_int)

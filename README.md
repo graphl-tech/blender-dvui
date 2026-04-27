@@ -245,12 +245,32 @@ started, it forwards every Blender event to DVUI:
 | `WHEELUP/DOWNMOUSE`        | `dvui_event_mouse_wheel(0, ±1)`                            |
 | Special keys (TAB, RET, BACK_SPACE, arrows, PAGE_UP/DOWN, HOME, END, INSERT, SPACE, modifiers, A–Z) | `dvui_event_key(code, pressed, mods)` |
 | `event.unicode` on PRESS   | `dvui_event_text(utf8 bytes)`                              |
+| `bpy.app.handlers.load_pre` | `dvui_event_app_quit` then `dvui_event_window_close`      |
+| `Addon.unregister`          | `dvui_event_app_quit` then `dvui_event_window_close`      |
 
 Each event function returns whether DVUI consumed it; when it did, the
 modal operator returns `RUNNING_MODAL` (event swallowed); otherwise it
 passes through so Blender's regular handling still applies. The Y axis
 is flipped inside the operator so DVUI sees top-left origin pixel
 coordinates.
+
+The C ABI also exposes everything else DVUI accepts, callable directly
+from Python via the loaded library handle on `session.native.lib` (or
+through helper methods on `DvuiSession`):
+
+| C function                             | Python helper                  | DVUI API                          |
+|----------------------------------------|--------------------------------|-----------------------------------|
+| `dvui_event_text_select(start, end)`   | `session.text_select(s, e)`    | `Window.addEventTextSelect`       |
+| `dvui_event_focus(x, y, button)`       | `session.focus_at(x, y, b)`    | `Window.addEventFocus`            |
+| `dvui_event_touch_motion(finger, x, y, dx, dy)` | `session.touch_motion(...)` | `Window.addEventTouchMotion`     |
+| `dvui_event_window_close(ctx)`         | (auto on `session.stop`)       | `Window.addEventWindow(.close)`   |
+| `dvui_event_app_quit(ctx)`             | `session.app_quit()`           | `Window.addEventApp(.quit)`       |
+| `dvui_cursor_over_floating(ctx)`       | `lib.dvui_cursor_over_floating(ctx)` | `Window.cursorRequestedFloating` |
+
+Blender exposes no native source for touch / pen-tip events at the
+modal-operator level, so `dvui_event_touch_motion` is wired only as a
+convenience entry point — call it from your own code if you obtain
+touch state another way.
 
 ## Edit the backend
 

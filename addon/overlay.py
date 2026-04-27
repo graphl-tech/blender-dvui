@@ -158,11 +158,39 @@ class DvuiSession:
             self.space_class.draw_handler_remove(self.draw_handler, "WINDOW")
             self.draw_handler = None
         if self.ctx:
+            # Let DVUI know the host window is going away before we tear
+            # down the context so widgets can react (close handlers etc).
+            self.native.lib.dvui_event_window_close(self.ctx)
             self.native.lib.dvui_destroy(self.ctx)
             self.ctx = None
         self.textures.clear()
         self.running = False
         self.stop_requested = True
+
+    # --- explicit DVUI event helpers ---
+
+    def text_select(self, start: int, end: int) -> bool:
+        if not self.running or self.ctx is None:
+            return False
+        return bool(self.native.lib.dvui_event_text_select(self.ctx, start, end))
+
+    def focus_at(self, x: float, y: float, button: int = -1) -> bool:
+        if not self.running or self.ctx is None:
+            return False
+        return bool(self.native.lib.dvui_event_focus(self.ctx, x, y, button))
+
+    def touch_motion(
+        self, finger: int, xnorm: float, ynorm: float, dxnorm: float, dynorm: float
+    ) -> bool:
+        if not self.running or self.ctx is None:
+            return False
+        return bool(self.native.lib.dvui_event_touch_motion(
+            self.ctx, finger, xnorm, ynorm, dxnorm, dynorm
+        ))
+
+    def app_quit(self) -> None:
+        if self.running and self.ctx is not None:
+            self.native.lib.dvui_event_app_quit(self.ctx)
 
     # --- texture cache ---
 
@@ -368,14 +396,32 @@ class Addon:
     space_type: str
     classes: tuple
     session: DvuiSession
+    _load_pre_handler: object = None
 
     def register(self) -> None:
         for c in self.classes:
             bpy.utils.register_class(c)
 
+        # Tell DVUI the app is quitting before Blender swaps the
+        # current scene out from under us, so close handlers can run.
+        def _on_load_pre(_a, _b):
+            if self.session.running:
+                self.session.app_quit()
+                self.session.stop()
+
+        self._load_pre_handler = _on_load_pre
+        bpy.app.handlers.load_pre.append(_on_load_pre)
+
     def unregister(self) -> None:
         if self.session.running:
+            self.session.app_quit()
             self.session.stop()
+        if self._load_pre_handler is not None:
+            try:
+                bpy.app.handlers.load_pre.remove(self._load_pre_handler)
+            except ValueError:
+                pass
+            self._load_pre_handler = None
         for c in reversed(self.classes):
             try:
                 bpy.utils.unregister_class(c)
