@@ -1,2 +1,7 @@
 # ignore inspiration project
 BlenderImgui/
+
+# zig
+zig-out
+zig-pkg
+.zig-cache
