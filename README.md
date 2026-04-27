@@ -1,7 +1,8 @@
 # blender-dvui
 
->! WARNING: this project has to this point been mostly written by AI coding tools,
->! and while I plan to personally vet every line, I haven't gotten around to doing so!
+> [!WARNING]
+> This project has to this point been mostly written by AI coding tools,
+> and while I plan to personally vet every line, I haven't gotten around to doing so!
 
 Render a [DVUI](https://github.com/david-vanderson/dvui) UI directly into
 Blender via a Zig backend that defers draw commands to a small Python
