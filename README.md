@@ -1,21 +1,24 @@
 # blender-dvui
 
 Render a [DVUI](https://github.com/david-vanderson/dvui) UI directly into
-Blender's 3D viewport via a Zig backend that defers draw commands to a
-small Python addon. Inspired by
+Blender via a Zig backend that defers draw commands to a small Python
+addon. Inspired by
 [BlenderImgui](https://github.com/eliemichel/BlenderImgui), but for DVUI
 and without exposing UI calls to Python — your UI is written in Zig and
 compiled into a shared library.
 
-The repo is a single Zig workspace with two sub-packages and a Python
-addon that ties them together:
+The repo is a single Zig workspace with two sub-packages, a Python
+addon, and a build helper that lets external projects package their own
+DVUI app as a Blender addon:
 
 ```
-backend/      zig pkg: deferred-render dvui Backend (no GL calls of its own)
-sample_app/   zig pkg: a minimal dvui app exposing `frame()`
-src/lib.zig   integrator: builds a cdylib with the C ABI Python uses
-addon/        Blender Python addon (ctypes + bpy.gpu rendering)
-scripts/      test_blender.py for one-shot iterate-and-screenshot runs
+backend/        zig pkg: deferred-render dvui Backend (no GL calls of its own)
+sample_app/     zig pkg: a minimal dvui app exposing `frame()`
+src/lib.zig     integrator: cdylib with the C ABI (mouse + keyboard + render)
+addon/          Blender Python addon (ctypes wrapper + bpy.gpu rendering +
+                  modal operator forwarding events to DVUI)
+build.zig       buildBlenderAddon() helper for external projects
+scripts/        test_blender.py for one-shot iterate-and-screenshot runs
 ```
 
 The Zig side records `(vertices, indices, draw_commands, textures)` per
@@ -41,33 +44,35 @@ via `BLENDER_DVUI_LIB` env var or by falling back to that path).
 
 ## Run inside Blender
 
-The addon lives at `addon/` and isn't installed into Blender's user
-addons directory — instead the test script puts the repo on `sys.path`
-and imports it. Open Blender with the script:
+The bundled sample addon lives at `addon/`. The test scripts put the
+repo on `sys.path` so the addon imports as a package without needing to
+be installed into Blender's user addons folder:
 
 ```bash
 zig build && blender --python scripts/test_blender.py
 ```
 
-Then in Blender:
+When Blender finishes loading:
 
-1. The script auto-runs `bpy.ops.dvui.start()` after ~1.5s, attaching a
-   `SpaceView3D` draw handler that runs your DVUI app each frame and
-   draws the result into the viewport.
-2. To stop: `bpy.ops.dvui.stop()` (also unregisters automatically when
-   the addon does, e.g. when Blender quits).
+1. The script invokes `bpy.ops.dvui_sample.start("INVOKE_DEFAULT")`,
+   which is a *modal operator* — it both attaches a `SpaceView3D` draw
+   handler and forwards mouse / wheel / keyboard / text events to DVUI.
+2. The 3D viewport's N-panel gains a `DVUI Sample` tab with start/stop
+   buttons (also: `bpy.ops.dvui_sample.stop()`).
+3. `bpy.ops.dvui_sample.start()` is automatically invoked from the test
+   script ~1.5s after launch.
 
-If you'd rather drive it manually, start Blender normally and from the
-Python console:
+To drive it manually, start Blender normally and from the Python
+console:
 
 ```python
 import sys; sys.path.insert(0, "/path/to/blender-dvui")
-from addon import overlay
-overlay.register()
-overlay.start()      # = bpy.ops.dvui.start()
+import addon as dvui_addon
+dvui_addon.register()
+dvui_addon.start()      # modal operator picks up cursor events
 # ... interact ...
-overlay.stop()
-overlay.unregister()
+dvui_addon.stop()
+dvui_addon.unregister()
 ```
 
 ### Headless smoke test
@@ -77,7 +82,8 @@ blender --background --python scripts/import_check.py
 ```
 
 Loads the cdylib, registers/unregisters the addon, and exits. Useful to
-catch ctypes signature drift after editing the C ABI.
+catch ctypes-signature drift after editing the C ABI; the wrapper
+asserts struct sizes match the Zig side at import time.
 
 ### Iterate-and-screenshot loop
 
@@ -89,6 +95,11 @@ After ~4s the script writes `scripts/out/dvui_overlay.png` (using
 `bpy.ops.screen.screenshot_area` so popups/splash don't appear) and
 quits Blender. Useful while tweaking the UI.
 
+Add `--click` to also drive a synthesized click sweep over the floating
+window through the C ABI; the sample app prints `[sample_app] click #N`
+when its button registers a press, which is a quick way to confirm the
+input pipeline still works after backend / Python changes.
+
 If Blender's splash window blocks the viewport during testing, disable
 it once:
 
@@ -99,7 +110,7 @@ blender --background --python -c \
 
 ## Edit the DVUI app
 
-The sample UI is one file:
+The sample UI lives in:
 
 ```
 sample_app/src/app.zig
@@ -126,18 +137,120 @@ After editing, rebuild and restart the running session:
 ```bash
 zig build
 # in Blender:
-bpy.ops.dvui.stop()
-bpy.ops.dvui.start()
+bpy.ops.dvui_sample.stop()
+bpy.ops.dvui_sample.start()
 ```
 
 > Hot-reload of the cdylib mid-session isn't supported — Python's
 > `ctypes.CDLL` keeps the library mapped for the life of the process.
-> Restart Blender (or `dvui.stop` then re-import the addon module after
-> evicting it from `sys.modules`) to pick up a new build.
+> Restart Blender (or stop, evict from `sys.modules`, re-import) to pick
+> up a new build.
 
 For DVUI's full widget vocabulary (layouts, themes, scrolling, etc.),
 see <https://david-vanderson.github.io/> and the examples under
 `~/opensource/dvui/examples/` if you have it cloned.
+
+## Package an external DVUI app as a Blender addon
+
+`build.zig` exposes a `buildBlenderAddon` helper. From the build.zig of
+your own project that already has a DVUI app module:
+
+```zig
+// build.zig
+const std = @import("std");
+const blender_dvui = @import("blender_dvui");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const dvui_dep = b.dependency("dvui", .{
+        .target = target,
+        .optimize = optimize,
+        .backend = .custom,           // required
+        .libc = true,
+        .freetype = false,
+        .@"stb-image" = true,
+    });
+    const dvui_mod = dvui_dep.module("dvui");
+
+    // Your DVUI app: must expose `pub fn frame() !void` and import dvui.
+    const my_app = b.addModule("my_app", .{
+        .root_source_file = b.path("src/app.zig"),
+        .target = target,
+        .imports = &.{ .{ .name = "dvui", .module = dvui_mod } },
+    });
+
+    const blender_dep = b.dependency("blender_dvui", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    blender_dvui.buildBlenderAddon(b, .{
+        .blender_dvui_dep = blender_dep,
+        .dvui_module = dvui_mod,
+        .app_module = my_app,
+        .app_name = "My Awesome UI",
+        .space_type = "VIEW_3D",      // any Blender editor enum
+        .target = target,
+        .optimize = optimize,
+    });
+}
+```
+
+`build.zig.zon` should pull in both `dvui` (with the same hash this
+repo uses; see `build.zig.zon`) and `blender_dvui` (path or url):
+
+```zig
+.dependencies = .{
+    .dvui = .{ .url = "...", .hash = "..." },
+    .blender_dvui = .{ .path = "../blender-dvui" },
+},
+```
+
+`zig build` then writes a self-contained addon directory:
+
+```
+zig-out/
+  blender_addon/
+    my_awesome_ui/
+      __init__.py        (templated for app_name / slug / space_type)
+      dvui_native.py     (verbatim copy)
+      overlay.py         (verbatim copy)
+      libmy_awesome_ui_dvui.so
+```
+
+Drop that directory into Blender's `addons/` folder, then enable
+"My Awesome UI" in *Edit > Preferences > Add-ons*. The N-panel of the
+configured editor will gain a tab labeled with `app_name` and a
+start/stop button. `bpy.ops.<slug>.start()` / `<slug>.stop()` are the
+operator names.
+
+The `space_type` parameter is one of the standard Blender editor enums
+(`"VIEW_3D"`, `"IMAGE_EDITOR"`, `"NODE_EDITOR"`, `"GRAPH_EDITOR"`,
+`"PROPERTIES"`, `"INFO"`, `"TEXT_EDITOR"`, etc.) — pick whichever
+Editor you'd like the overlay to take over. Blender doesn't allow
+registering brand-new editor types from Python, but configuring an
+existing area to host a DVUI overlay is the next-best thing.
+
+## Input handling
+
+The bundled `addon/overlay.py` defines a *modal operator* per app. Once
+started, it forwards every Blender event to DVUI:
+
+| Blender event              | DVUI call                                                  |
+|----------------------------|------------------------------------------------------------|
+| `MOUSEMOVE`                | `dvui_event_mouse_motion(x, y)` (top-left origin)         |
+| `LEFTMOUSE` / `RIGHT` / `MIDDLEMOUSE` | `dvui_event_mouse_button(button, pressed)`      |
+| `WHEELUP/DOWNMOUSE`        | `dvui_event_mouse_wheel(0, ±1)`                            |
+| Special keys (TAB, RET, BACK_SPACE, arrows, PAGE_UP/DOWN, HOME, END, INSERT, SPACE, modifiers, A–Z) | `dvui_event_key(code, pressed, mods)` |
+| `event.unicode` on PRESS   | `dvui_event_text(utf8 bytes)`                              |
+
+Each event function returns whether DVUI consumed it; when it did, the
+modal operator returns `RUNNING_MODAL` (event swallowed); otherwise it
+passes through so Blender's regular handling still applies. The Y axis
+is flipped inside the operator so DVUI sees top-left origin pixel
+coordinates.
 
 ## Edit the backend
 
@@ -162,24 +275,20 @@ at import time, so a mismatch fails loudly.
 `addon/overlay.py` owns the per-frame render loop on the Python side:
 
 - One `gpu.types.GPUShader` built via `GPUShaderCreateInfo` (vertex
-  uses an ortho `ProjMtx` mapping dvui's top-left pixel space to clip
+  uses an ortho `ProjMtx` mapping DVUI's top-left pixel space to clip
   space; fragment is `frag = v_col * texture(tex, v_uv)`)
 - A 1×1 white `GPUTexture` is bound when DVUI emits `texture_id == 0`
 - Texture creates/destroys are drained each frame; pixel data goes
   through a one-time `ctypes.string_at` -> `Buffer("FLOAT", ...)`
   conversion (current Blender's `GPUTexture` constructor only accepts
   float buffers)
-- Scissor rect from each `DrawCmd` is mapped from dvui's top-left
+- Scissor rect from each `DrawCmd` is mapped from DVUI's top-left
   origin to GL's bottom-left origin
 
-## Input events (not wired yet)
-
-The C ABI exposes `dvui_event_mouse_motion`, `dvui_event_mouse_button`,
-`dvui_event_mouse_wheel`, and `dvui_event_text`, but the addon currently
-registers a draw handler only — it doesn't forward Blender events to
-DVUI yet. Adding it means promoting `dvui.start` to a modal operator
-that calls those functions in its `modal()` callback (see BlenderImgui's
-`ImguiBasedOperator` for the same pattern).
+`overlay.make_addon(app_name, space_type, slug=, lib_basename=)` is the
+factory that produces the per-app `Operator` / `Panel` classes; the
+auto-generated addons from `buildBlenderAddon` call it from their
+templated `__init__.py`.
 
 ## Architecture notes
 
@@ -189,7 +298,7 @@ that calls those functions in its `modal()` callback (see BlenderImgui's
   `dvui` module is exposed; the root `build.zig` does `linkBackend`
   manually (`backend_mod.addImport("dvui", dvui_mod); dvui_mod.addImport("backend", backend_mod);`)
 - Premultiplied alpha all the way through — `Color.PMA` is what DVUI
-  hands us, blender's `gpu.state.blend_set("ALPHA_PREMULT")` matches
+  hands us, Blender's `gpu.state.blend_set("ALPHA_PREMULT")` matches
 - A render-target texture path (`textureCreateTarget` etc.) is stubbed
   out with `error.NotImplemented` / `error.TextureCreate`; widgets that
   rely on it (e.g. `dvui.Picture`) won't work until that's added

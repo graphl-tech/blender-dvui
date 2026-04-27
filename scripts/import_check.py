@@ -13,9 +13,9 @@ os.environ.setdefault(
 )
 
 import bpy  # noqa: E402,F401
-from addon import overlay  # noqa: E402
+import addon as dvui_addon  # noqa: E402
 
-overlay.register()
+dvui_addon.register()
 print("[ok] addon registered")
-overlay.unregister()
+dvui_addon.unregister()
 print("[ok] addon unregistered")

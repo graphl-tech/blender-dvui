@@ -1,20 +1,39 @@
-"""DVUI overlay drawn on top of the 3D viewport.
+"""Per-app DVUI overlay infrastructure.
 
-Pulls the deferred draw stream out of the Zig backend each frame and
-renders it using Blender's `gpu` module.
+Use :func:`make_addon` to build a self-contained set of Blender classes
+(operators + panel) bound to a particular DVUI app and target editor
+(space) type. The same module backs both the bundled sample app and the
+addons produced by ``buildBlenderAddon``.
+
+Each app gets:
+
+* A modal operator ``<slug>.start`` that sets up rendering and forwards
+  Blender events to DVUI.
+* A stop operator ``<slug>.stop``.
+* A sidebar panel in the chosen editor with start / stop buttons and a
+  small status readout.
+* A draw handler that renders DVUI commands using Blender's ``gpu``
+  module.
+
+The DVUI rendering is deferred: each frame the C library populates
+vertex / index / command buffers, and the draw handler dispatches them
+through a custom ``GPUShader``.
 """
 
 from __future__ import annotations
 
 import ctypes as C
+import re
+from dataclasses import dataclass, field
+from typing import Optional
 
 import bpy
 import gpu
-from bpy.types import Operator, SpaceView3D
+from bpy.types import Operator, Panel
 from gpu_extras.batch import batch_for_shader
 from mathutils import Matrix
 
-from . import dvui_native as native
+from . import dvui_native
 
 
 VERTEX_SOURCE = """
@@ -32,11 +51,15 @@ void main() {
 """
 
 
-_shader: gpu.types.GPUShader | None = None
-_white_tex: gpu.types.GPUTexture | None = None
+_shader_cache: dict[int, gpu.types.GPUShader] = {}
+_white_cache: dict[int, gpu.types.GPUTexture] = {}
 
 
-def _build_shader() -> gpu.types.GPUShader:
+def _get_shader() -> gpu.types.GPUShader:
+    key = 0
+    cached = _shader_cache.get(key)
+    if cached is not None:
+        return cached
     info = gpu.types.GPUShaderCreateInfo()
     info.push_constant("MAT4", "ProjMtx")
     info.sampler(0, "FLOAT_2D", "tex")
@@ -52,109 +75,137 @@ def _build_shader() -> gpu.types.GPUShader:
     info.fragment_out(0, "VEC4", "frag")
     info.vertex_source(VERTEX_SOURCE)
     info.fragment_source(FRAGMENT_SOURCE)
-    return gpu.shader.create_from_info(info)
+    sh = gpu.shader.create_from_info(info)
+    _shader_cache[key] = sh
+    return sh
 
 
-def _get_shader() -> gpu.types.GPUShader:
-    global _shader
-    if _shader is None:
-        _shader = _build_shader()
-    return _shader
+def _get_white() -> gpu.types.GPUTexture:
+    key = 0
+    cached = _white_cache.get(key)
+    if cached is not None:
+        return cached
+    buf = gpu.types.Buffer("FLOAT", 4, [1.0, 1.0, 1.0, 1.0])
+    tex = gpu.types.GPUTexture(size=(1, 1), format="RGBA8", data=buf)
+    _white_cache[key] = tex
+    return tex
 
 
-def _get_white_texture() -> gpu.types.GPUTexture:
-    global _white_tex
-    if _white_tex is None:
-        # 1x1 opaque white, used when DVUI emits a draw call without a texture.
-        buf = gpu.types.Buffer("FLOAT", 4, [1.0, 1.0, 1.0, 1.0])
-        _white_tex = gpu.types.GPUTexture(size=(1, 1), format="RGBA8", data=buf)
-    return _white_tex
+def _resolve_space_class(space_type: str) -> type:
+    """Map a Blender editor enum like 'VIEW_3D' to its bpy.types.Space* class."""
+    name = "Space" + "".join(part.capitalize() for part in space_type.split("_"))
+    cls = getattr(bpy.types, name, None)
+    if cls is None:
+        # Common aliases that don't follow the simple pattern.
+        fallback = {
+            "VIEW_3D": "SpaceView3D",
+            "IMAGE_EDITOR": "SpaceImageEditor",
+            "NODE_EDITOR": "SpaceNodeEditor",
+            "SEQUENCE_EDITOR": "SpaceSequenceEditor",
+            "FILE_BROWSER": "SpaceFileBrowser",
+            "TEXT_EDITOR": "SpaceTextEditor",
+            "GRAPH_EDITOR": "SpaceGraphEditor",
+            "DOPESHEET_EDITOR": "SpaceDopeSheetEditor",
+            "NLA_EDITOR": "SpaceNLA",
+            "INFO": "SpaceInfo",
+            "PROPERTIES": "SpaceProperties",
+            "OUTLINER": "SpaceOutliner",
+            "PREFERENCES": "SpacePreferences",
+            "CONSOLE": "SpaceConsole",
+        }.get(space_type)
+        if fallback:
+            cls = getattr(bpy.types, fallback, None)
+    if cls is None:
+        raise ValueError(f"unknown space type {space_type!r}")
+    return cls
 
 
+@dataclass
 class DvuiSession:
-    """Owns one dvui context + its draw handler + its texture cache."""
+    app_name: str
+    space_type: str
+    native: dvui_native.Native
 
-    def __init__(self) -> None:
-        self.ctx: int | None = None
-        self.draw_handler = None
-        self.textures: dict[int, gpu.types.GPUTexture] = {}
-        self.width = 0
-        self.height = 0
-        self.region = None
+    ctx: Optional[int] = None
+    draw_handler: object = None
+    space_class: object = None
+    textures: dict[int, gpu.types.GPUTexture] = field(default_factory=dict)
+    width: int = 0
+    height: int = 0
+    last_pixel: tuple[int, int] = (0, 0)
+    running: bool = False
+    stop_requested: bool = False
 
     # --- lifecycle ---
 
     def start(self) -> None:
-        # Initial size; will be updated each draw from the region.
-        self.ctx = native.lib.dvui_create(800, 600)
+        if self.running:
+            return
+        self.space_class = _resolve_space_class(self.space_type)
+        self.ctx = self.native.lib.dvui_create(800, 600)
         if not self.ctx:
             raise RuntimeError("dvui_create failed")
-        self.draw_handler = SpaceView3D.draw_handler_add(
+        self.draw_handler = self.space_class.draw_handler_add(
             self._draw, (), "WINDOW", "POST_PIXEL"
         )
+        self.running = True
+        self.stop_requested = False
 
     def stop(self) -> None:
-        if self.draw_handler is not None:
-            SpaceView3D.draw_handler_remove(self.draw_handler, "WINDOW")
+        if not self.running:
+            return
+        if self.draw_handler is not None and self.space_class is not None:
+            self.space_class.draw_handler_remove(self.draw_handler, "WINDOW")
             self.draw_handler = None
         if self.ctx:
-            native.lib.dvui_destroy(self.ctx)
+            self.native.lib.dvui_destroy(self.ctx)
             self.ctx = None
         self.textures.clear()
+        self.running = False
+        self.stop_requested = True
 
     # --- texture cache ---
 
     def _sync_textures(self) -> None:
-        # Drain creates.
         cap = 32
-        creates = (native.TextureInfo * cap)()
+        creates = (self.native.TextureInfo * cap)()
         while True:
-            n = native.lib.dvui_drain_texture_creates(self.ctx, creates, cap)
+            n = self.native.lib.dvui_drain_texture_creates(self.ctx, creates, cap)
             for i in range(n):
                 info = creates[i]
                 size = info.width * info.height * 4
-                # GPUTexture data buffer must be FLOAT in current Blender.
                 pixel_bytes = C.string_at(info.pixels, size)
-                floats = [b / 255.0 for b in pixel_bytes]
-                buf = gpu.types.Buffer("FLOAT", size, floats)
+                buf = gpu.types.Buffer("FLOAT", size, [b / 255.0 for b in pixel_bytes])
                 tex = gpu.types.GPUTexture(
-                    size=(info.width, info.height),
-                    format="RGBA8",
-                    data=buf,
+                    size=(info.width, info.height), format="RGBA8", data=buf
                 )
-                # If we already had a texture with this id (re-upload after
-                # textureUpdate), the dict overwrite drops the old GPUTexture.
                 self.textures[info.id] = tex
             if n < cap:
                 break
 
-        # Drain destroys.
         destroys = (C.c_uint32 * cap)()
         while True:
-            n = native.lib.dvui_drain_texture_destroys(self.ctx, destroys, cap)
+            n = self.native.lib.dvui_drain_texture_destroys(self.ctx, destroys, cap)
             for i in range(n):
                 self.textures.pop(destroys[i], None)
             if n < cap:
                 break
 
-    # --- draw ---
+    # --- per-frame draw ---
 
     def _draw(self) -> None:
         ctx = bpy.context
         region = ctx.region
         if region is None:
             return
-
-        self.region = region
         w, h = region.width, region.height
-
         if (w, h) != (self.width, self.height):
             self.width, self.height = w, h
-            native.lib.dvui_resize(self.ctx, w, h)
+            self.native.lib.dvui_resize(self.ctx, w, h)
 
-        rc = native.lib.dvui_frame(self.ctx)
+        rc = self.native.lib.dvui_frame(self.ctx)
         if rc != 0:
-            print(f"[dvui] frame error: {rc}")
+            print(f"[dvui:{self.app_name}] frame error: {rc}")
             return
 
         self._sync_textures()
@@ -164,19 +215,15 @@ class DvuiSession:
         n_v = C.c_uint32()
         n_i = C.c_uint32()
         n_c = C.c_uint32()
-        verts = native.lib.dvui_vertices(self.ctx, C.byref(n_v))
-        inds = native.lib.dvui_indices(self.ctx, C.byref(n_i))
-        cmds = native.lib.dvui_commands(self.ctx, C.byref(n_c))
-
+        verts = self.native.lib.dvui_vertices(self.ctx, C.byref(n_v))
+        inds = self.native.lib.dvui_indices(self.ctx, C.byref(n_i))
+        cmds = self.native.lib.dvui_commands(self.ctx, C.byref(n_c))
         if n_c.value == 0:
             return
 
         shader = _get_shader()
-        white = _get_white_texture()
+        white = _get_white()
 
-        w, h = self.width, self.height
-
-        # Snapshot vertex/index data once into Python-managed lists.
         v_count = n_v.value
         positions = [None] * v_count
         uvs = [None] * v_count
@@ -187,7 +234,7 @@ class DvuiSession:
             uvs[k] = (v.u, v.v)
             colors[k] = (v.r / 255.0, v.g / 255.0, v.b / 255.0, v.a / 255.0)
 
-        # Ortho mapping: dvui top-left pixel space -> clip space.
+        w, h = self.width, self.height
         proj = Matrix((
             (2.0 / w, 0.0, 0.0, -1.0),
             (0.0, -2.0 / h, 0.0, 1.0),
@@ -195,7 +242,6 @@ class DvuiSession:
             (0.0, 0.0, 0.0, 1.0),
         ))
 
-        # Save / set GL state via gpu module wrappers.
         prev_blend = gpu.state.blend_get()
         prev_depth = gpu.state.depth_test_get()
         gpu.state.blend_set("ALPHA_PREMULT")
@@ -212,7 +258,6 @@ class DvuiSession:
                 cmd = cmds[k]
                 if cmd.idx_count == 0:
                     continue
-
                 if cmd.has_clip:
                     cx, cy, cw, ch = cmd.clip_x, cmd.clip_y, cmd.clip_w, cmd.clip_h
                     gpu.state.scissor_set(cx, h - (cy + ch), max(0, cw), max(0, ch))
@@ -224,11 +269,10 @@ class DvuiSession:
 
                 start = cmd.idx_offset
                 end = start + cmd.idx_count
-                indices = [(inds[start + 3 * t],
-                            inds[start + 3 * t + 1],
-                            inds[start + 3 * t + 2])
-                           for t in range((end - start) // 3)]
-
+                indices = [
+                    (inds[start + 3 * t], inds[start + 3 * t + 1], inds[start + 3 * t + 2])
+                    for t in range((end - start) // 3)
+                ]
                 batch = batch_for_shader(
                     shader,
                     "TRIS",
@@ -241,66 +285,266 @@ class DvuiSession:
             gpu.state.depth_test_set(prev_depth)
             gpu.state.scissor_test_set(False)
 
+    # --- input forwarding ---
 
-_session: DvuiSession | None = None
+    def forward_event(self, region, event) -> bool:
+        """Push a Blender event to DVUI. Returns True if dvui consumed it."""
+        if not self.running or self.ctx is None:
+            return False
+
+        # DVUI uses top-left origin pixel coords; Blender's mouse_region_y
+        # is bottom-up.
+        x = float(event.mouse_region_x)
+        y = float(region.height - 1 - event.mouse_region_y)
+        self.last_pixel = (int(x), int(y))
+
+        et = event.type
+        ev = event.value
+        mods = dvui_native.blender_event_mods(event)
+
+        if et == "MOUSEMOVE":
+            self.native.lib.dvui_event_mouse_motion(self.ctx, x, y)
+            return False  # always pass through
+
+        if et == "LEFTMOUSE":
+            self.native.lib.dvui_event_mouse_motion(self.ctx, x, y)
+            handled = self.native.lib.dvui_event_mouse_button(
+                self.ctx, 0, 1 if ev == "PRESS" else 0
+            )
+            return bool(handled)
+
+        if et == "RIGHTMOUSE":
+            handled = self.native.lib.dvui_event_mouse_button(
+                self.ctx, 2, 1 if ev == "PRESS" else 0
+            )
+            return bool(handled)
+
+        if et == "MIDDLEMOUSE":
+            handled = self.native.lib.dvui_event_mouse_button(
+                self.ctx, 1, 1 if ev == "PRESS" else 0
+            )
+            return bool(handled)
+
+        if et == "WHEELUPMOUSE":
+            handled = self.native.lib.dvui_event_mouse_wheel(self.ctx, 0.0, 1.0)
+            return bool(handled)
+        if et == "WHEELDOWNMOUSE":
+            handled = self.native.lib.dvui_event_mouse_wheel(self.ctx, 0.0, -1.0)
+            return bool(handled)
+
+        # Special key?
+        code = dvui_native.BLENDER_KEY_TO_CODE.get(et)
+        if code is not None:
+            pressed = 1 if ev == "PRESS" else (0 if ev == "RELEASE" else 2)
+            handled = self.native.lib.dvui_event_key(self.ctx, code, pressed, mods)
+        else:
+            handled = 0
+
+        # Printable text via event.unicode (only on PRESS).
+        if ev == "PRESS" and event.unicode:
+            data = event.unicode.encode("utf-8")
+            handled |= self.native.lib.dvui_event_text(
+                self.ctx, data, len(data)
+            )
+
+        return bool(handled)
 
 
-class DVUI_OT_start(Operator):
-    bl_idname = "dvui.start"
-    bl_label = "Start DVUI overlay"
-
-    def execute(self, context):
-        global _session
-        if _session is not None:
-            self.report({"WARNING"}, "DVUI already running")
-            return {"CANCELLED"}
-        _session = DvuiSession()
-        _session.start()
-        # Force redraw of all 3D views so the overlay appears immediately.
-        for area in context.window.screen.areas:
-            if area.type == "VIEW_3D":
-                area.tag_redraw()
-        return {"FINISHED"}
+def _slugify(name: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "_", name).strip("_").lower()
+    if not s:
+        s = "dvui_app"
+    if not s[0].isalpha():
+        s = "a_" + s
+    return s
 
 
-class DVUI_OT_stop(Operator):
-    bl_idname = "dvui.stop"
-    bl_label = "Stop DVUI overlay"
+@dataclass
+class Addon:
+    """The bundle returned by :func:`make_addon`."""
 
-    def execute(self, context):
-        global _session
-        if _session is None:
-            self.report({"WARNING"}, "DVUI not running")
-            return {"CANCELLED"}
-        _session.stop()
-        _session = None
-        for area in context.window.screen.areas:
-            if area.type == "VIEW_3D":
-                area.tag_redraw()
-        return {"FINISHED"}
+    app_name: str
+    slug: str
+    space_type: str
+    classes: tuple
+    session: DvuiSession
 
+    def register(self) -> None:
+        for c in self.classes:
+            bpy.utils.register_class(c)
 
-classes = (DVUI_OT_start, DVUI_OT_stop)
+    def unregister(self) -> None:
+        if self.session.running:
+            self.session.stop()
+        for c in reversed(self.classes):
+            try:
+                bpy.utils.unregister_class(c)
+            except Exception:
+                pass
 
+    def start(self) -> None:
+        bpy.ops.__getattr__(self.slug).start("INVOKE_DEFAULT")
 
-def register():
-    for c in classes:
-        bpy.utils.register_class(c)
-
-
-def unregister():
-    global _session
-    if _session is not None:
-        _session.stop()
-        _session = None
-    for c in reversed(classes):
-        bpy.utils.unregister_class(c)
+    def stop(self) -> None:
+        bpy.ops.__getattr__(self.slug).stop()
 
 
-def start():
-    """Convenience entry point for scripts."""
-    bpy.ops.dvui.start()
+def make_addon(
+    app_name: str,
+    space_type: str = "VIEW_3D",
+    *,
+    slug: Optional[str] = None,
+    native: Optional[dvui_native.Native] = None,
+    lib_basename: str = "libblender_dvui",
+) -> Addon:
+    """Build the operator + panel classes for a DVUI app.
 
+    Parameters
+    ----------
+    app_name:
+        Human-readable label used in operator labels, the sidebar tab
+        and panel header.
+    space_type:
+        Editor enum like ``"VIEW_3D"`` or ``"IMAGE_EDITOR"`` where the
+        DVUI overlay should render.
+    slug:
+        Operator namespace; lowercased / sanitized from ``app_name`` if
+        omitted. Becomes the ``bpy.ops.<slug>.start`` / ``stop`` prefix.
+    native:
+        A pre-loaded :class:`dvui_native.Native` to share across calls;
+        loads ``lib_basename`` if not supplied.
+    lib_basename:
+        Used to discover the shared library on disk.
+    """
+    slug = slug or _slugify(app_name)
+    if native is None:
+        native = dvui_native.load(lib_basename)
 
-def stop():
-    bpy.ops.dvui.stop()
+    session = DvuiSession(
+        app_name=app_name,
+        space_type=space_type,
+        native=native,
+    )
+
+    cap_slug = "".join(part.capitalize() for part in slug.split("_"))
+
+    class _Start(Operator):
+        bl_idname = f"{slug}.start"
+        bl_label = f"Start {app_name}"
+        bl_description = f"Begin rendering the {app_name} DVUI overlay in this editor"
+
+        _timer = None
+
+        def invoke(self, ctx, event):
+            if session.running:
+                self.report({"WARNING"}, f"{app_name} already running")
+                return {"CANCELLED"}
+            try:
+                session.start()
+            except Exception as exc:
+                self.report({"ERROR"}, f"failed to start: {exc}")
+                return {"CANCELLED"}
+
+            wm = ctx.window_manager
+            self._timer = wm.event_timer_add(1.0 / 60.0, window=ctx.window)
+            wm.modal_handler_add(self)
+
+            for area in ctx.window.screen.areas:
+                if area.type == space_type:
+                    area.tag_redraw()
+            return {"RUNNING_MODAL"}
+
+        def modal(self, ctx, event):
+            if session.stop_requested or not session.running:
+                self._cleanup(ctx)
+                return {"CANCELLED"}
+
+            # Find the region the cursor is in within an area of our space.
+            region = None
+            area_in = None
+            for area in ctx.window.screen.areas:
+                if area.type != space_type:
+                    continue
+                if not (
+                    area.x <= event.mouse_x <= area.x + area.width
+                    and area.y <= event.mouse_y <= area.y + area.height
+                ):
+                    continue
+                area_in = area
+                for r in area.regions:
+                    if r.type != "WINDOW":
+                        continue
+                    if (
+                        r.x <= event.mouse_x <= r.x + r.width
+                        and r.y <= event.mouse_y <= r.y + r.height
+                    ):
+                        region = r
+                        break
+                break
+
+            if event.type == "TIMER":
+                # Periodic redraw so animations & blinking caret advance.
+                for area in ctx.window.screen.areas:
+                    if area.type == space_type:
+                        area.tag_redraw()
+                return {"PASS_THROUGH"}
+
+            if region is not None:
+                handled = session.forward_event(region, event)
+                if area_in is not None:
+                    area_in.tag_redraw()
+                if handled:
+                    return {"RUNNING_MODAL"}
+            return {"PASS_THROUGH"}
+
+        def _cleanup(self, ctx):
+            if self._timer is not None:
+                ctx.window_manager.event_timer_remove(self._timer)
+                self._timer = None
+            session.stop()
+            for area in ctx.window.screen.areas:
+                if area.type == space_type:
+                    area.tag_redraw()
+
+    _Start.__name__ = f"{cap_slug.upper()}_OT_start"
+
+    class _Stop(Operator):
+        bl_idname = f"{slug}.stop"
+        bl_label = f"Stop {app_name}"
+
+        def execute(self, ctx):
+            if not session.running:
+                return {"CANCELLED"}
+            session.stop_requested = True
+            return {"FINISHED"}
+
+    _Stop.__name__ = f"{cap_slug.upper()}_OT_stop"
+
+    class _Panel(Panel):
+        bl_idname = f"{cap_slug.upper()}_PT_panel"
+        bl_label = app_name
+        bl_space_type = space_type
+        bl_region_type = "UI"
+        bl_category = app_name
+
+        def draw(self, ctx):
+            layout = self.layout
+            row = layout.row(align=True)
+            if session.running:
+                row.label(text="Running", icon="RADIOBUT_ON")
+                row.operator(_Stop.bl_idname, text="Stop", icon="PAUSE")
+            else:
+                row.label(text="Stopped", icon="RADIOBUT_OFF")
+                row.operator(_Start.bl_idname, text="Start", icon="PLAY")
+            layout.label(text=f"Editor: {space_type}")
+            layout.label(text=f"slug: {slug}")
+
+    _Panel.__name__ = f"{cap_slug.upper()}_PT_panel"
+
+    return Addon(
+        app_name=app_name,
+        slug=slug,
+        space_type=space_type,
+        classes=(_Start, _Stop, _Panel),
+        session=session,
+    )

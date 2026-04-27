@@ -31,6 +31,7 @@ pub fn frame() !void {
 
     if (dvui.button(@src(), "Click me", .{}, .{})) {
         click_count += 1;
+        std.debug.print("[sample_app] click #{d}\n", .{click_count});
     }
 
     _ = dvui.slider(@src(), .{ .dir = .horizontal, .fraction = &slider_val }, .{

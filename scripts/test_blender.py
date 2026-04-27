@@ -21,9 +21,9 @@ os.environ.setdefault(
     str(REPO / "zig-out" / "lib" / "libblender_dvui.so"),
 )
 
-from addon import overlay  # noqa: E402
+import addon as dvui_addon  # noqa: E402
 
-overlay.register()
+dvui_addon.register()
 
 
 def _redraw_all():
@@ -38,11 +38,42 @@ def _redraw_all():
 
 def _start_dvui():
     print("[test] starting dvui...")
-    try:
-        bpy.ops.dvui.start()
-    except Exception as e:
-        print(f"[test] dvui.start failed: {e}")
+    # Override context to a VIEW_3D area so the modal operator sees one.
+    win = bpy.context.window_manager.windows[0]
+    area = next((a for a in win.screen.areas if a.type == "VIEW_3D"), None)
+    if area is None:
+        print("[test] no VIEW_3D area found")
         return None
+    region = next((r for r in area.regions if r.type == "WINDOW"), None)
+    try:
+        with bpy.context.temp_override(window=win, area=area, region=region):
+            bpy.ops.dvui_sample.start("INVOKE_DEFAULT")
+    except Exception as e:
+        print(f"[test] dvui_sample.start failed: {e}")
+        return None
+    _redraw_all()
+    return None
+
+
+def _inject_click():
+    """Drive the C ABI directly to simulate a click on the 'Click me' button.
+
+    This bypasses Blender's event loop so we can verify the C ABI + dvui
+    input plumbing in a one-shot screenshot test.
+    """
+    session = dvui_addon._addon.session if dvui_addon._addon else None
+    if session is None or not session.running:
+        print("[test] dvui session not running, can't inject")
+        return None
+    lib = session.native.lib
+    # Sweep a few likely Y positions so at least one lands on the button
+    # regardless of the exact widget layout (DVUI lays out top-down).
+    cx = 1040.0
+    for cy in (570, 590, 610, 630, 650):
+        lib.dvui_event_mouse_motion(session.ctx, cx, float(cy))
+        lib.dvui_event_mouse_button(session.ctx, 0, 1)
+        lib.dvui_event_mouse_button(session.ctx, 0, 0)
+    print(f"[test] injected click sweep at x={cx}")
     _redraw_all()
     return None
 
@@ -90,7 +121,18 @@ def _take_screenshot():
 # Schedule via timers so they fire after Blender's UI is up.
 bpy.app.timers.register(_start_dvui, first_interval=1.5)
 bpy.app.timers.register(_redraw_all, first_interval=3.0)
-bpy.app.timers.register(_take_screenshot, first_interval=4.0)
+
+if "--click" in sys.argv:
+    bpy.app.timers.register(_inject_click, first_interval=3.5)
+    bpy.app.timers.register(_inject_click, first_interval=4.0)
+    bpy.app.timers.register(_inject_click, first_interval=4.5)
+    screenshot_at = 5.0
+    quit_at = 6.5
+else:
+    screenshot_at = 4.0
+    quit_at = 5.5
+
+bpy.app.timers.register(_take_screenshot, first_interval=screenshot_at)
 
 
 # Auto-quit when running with `--auto-quit` so CI-like loops can iterate.
@@ -100,4 +142,4 @@ if "--auto-quit" in sys.argv:
         bpy.ops.wm.quit_blender()
         return None
 
-    bpy.app.timers.register(_quit, first_interval=5.5)
+    bpy.app.timers.register(_quit, first_interval=quit_at)

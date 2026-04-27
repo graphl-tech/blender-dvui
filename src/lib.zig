@@ -13,7 +13,8 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const blender_backend = @import("blender_backend");
-const sample_app = @import("sample_app");
+/// The user's DVUI app module. Must export `pub fn frame() !void`.
+const app = @import("app");
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -83,24 +84,137 @@ fn mapMouseButton(c: c_int) ?dvui.enums.Button {
     };
 }
 
-export fn dvui_event_mouse_button(ctx: *Ctx, button: c_int, pressed: c_int) void {
-    const b = mapMouseButton(button) orelse return;
+/// Returns 1 if dvui considered the event handled, 0 otherwise.
+export fn dvui_event_mouse_button(ctx: *Ctx, button: c_int, pressed: c_int) c_int {
+    const b = mapMouseButton(button) orelse return 0;
     const action: dvui.Event.Mouse.Action = if (pressed != 0) .press else .release;
-    _ = ctx.window.addEventMouseButton(b, action) catch {};
+    const handled = ctx.window.addEventMouseButton(b, action) catch return 0;
+    return if (handled) 1 else 0;
 }
 
-export fn dvui_event_mouse_wheel(ctx: *Ctx, dx: f32, dy: f32) void {
-    if (dy != 0) _ = ctx.window.addEventMouseWheel(dy, .vertical) catch {};
-    if (dx != 0) _ = ctx.window.addEventMouseWheel(dx, .horizontal) catch {};
+export fn dvui_event_mouse_wheel(ctx: *Ctx, dx: f32, dy: f32) c_int {
+    var handled: bool = false;
+    if (dy != 0) {
+        if (ctx.window.addEventMouseWheel(dy, .vertical)) |h| {
+            handled = handled or h;
+        } else |_| {}
+    }
+    if (dx != 0) {
+        if (ctx.window.addEventMouseWheel(dx, .horizontal)) |h| {
+            handled = handled or h;
+        } else |_| {}
+    }
+    return if (handled) 1 else 0;
 }
 
-export fn dvui_event_text(ctx: *Ctx, ptr: [*]const u8, len: u32) void {
-    _ = ctx.window.addEventText(.{ .text = ptr[0..len] }) catch {};
+export fn dvui_event_text(ctx: *Ctx, ptr: [*]const u8, len: u32) c_int {
+    const handled = ctx.window.addEventText(.{ .text = ptr[0..len] }) catch return 0;
+    return if (handled) 1 else 0;
+}
+
+/// Stable integer key codes that Python forwards. Kept independent of
+/// dvui.enums.Key so we don't pin the addon to a specific dvui version.
+pub const KeyCode = enum(c_int) {
+    none = 0,
+    backspace = 1,
+    delete = 2,
+    enter = 3,
+    escape = 4,
+    tab = 5,
+    home = 6,
+    end_ = 7,
+    page_up = 8,
+    page_down = 9,
+    left = 10,
+    right = 11,
+    up = 12,
+    down = 13,
+    insert = 14,
+    space = 15,
+    left_shift = 20,
+    right_shift = 21,
+    left_control = 22,
+    right_control = 23,
+    left_alt = 24,
+    right_alt = 25,
+    a = 100, b, c, d, e, f, g, h, i, j, k, l, m,
+    n, o, p, q, r, s, t, u, v, w, x, y, z,
+    _,
+};
+
+fn mapKeyCode(code: c_int) ?dvui.enums.Key {
+    const k: KeyCode = @enumFromInt(code);
+    return switch (k) {
+        .none => null,
+        .backspace => .backspace,
+        .delete => .delete,
+        .enter => .enter,
+        .escape => .escape,
+        .tab => .tab,
+        .home => .home,
+        .end_ => .end,
+        .page_up => .page_up,
+        .page_down => .page_down,
+        .left => .left,
+        .right => .right,
+        .up => .up,
+        .down => .down,
+        .insert => .insert,
+        .space => .space,
+        .left_shift => .left_shift,
+        .right_shift => .right_shift,
+        .left_control => .left_control,
+        .right_control => .right_control,
+        .left_alt => .left_alt,
+        .right_alt => .right_alt,
+        .a => .a, .b => .b, .c => .c, .d => .d, .e => .e, .f => .f,
+        .g => .g, .h => .h, .i => .i, .j => .j, .k => .k, .l => .l,
+        .m => .m, .n => .n, .o => .o, .p => .p, .q => .q, .r => .r,
+        .s => .s, .t => .t, .u => .u, .v => .v, .w => .w, .x => .x,
+        .y => .y, .z => .z,
+        _ => null,
+    };
+}
+
+const C_MOD_SHIFT: c_int = 1 << 0;
+const C_MOD_CTRL: c_int = 1 << 1;
+const C_MOD_ALT: c_int = 1 << 2;
+const C_MOD_CMD: c_int = 1 << 3;
+
+fn mapMod(mods: c_int) dvui.enums.Mod {
+    var out: u16 = 0;
+    if (mods & C_MOD_SHIFT != 0) out |= @intFromEnum(dvui.enums.Mod.lshift);
+    if (mods & C_MOD_CTRL != 0) out |= @intFromEnum(dvui.enums.Mod.lcontrol);
+    if (mods & C_MOD_ALT != 0) out |= @intFromEnum(dvui.enums.Mod.lalt);
+    if (mods & C_MOD_CMD != 0) out |= @intFromEnum(dvui.enums.Mod.lcommand);
+    return @enumFromInt(out);
+}
+
+/// `pressed`: 0 = up, 1 = down, 2 = repeat. Returns 1 if dvui handled.
+export fn dvui_event_key(ctx: *Ctx, code: c_int, pressed: c_int, mods: c_int) c_int {
+    const key = mapKeyCode(code) orelse return 0;
+    const action: @TypeOf(@as(dvui.Event.Key, undefined).action) = switch (pressed) {
+        0 => .up,
+        2 => .repeat,
+        else => .down,
+    };
+    const handled = ctx.window.addEventKey(.{
+        .code = key,
+        .action = action,
+        .mod = mapMod(mods),
+    }) catch return 0;
+    return if (handled) 1 else 0;
+}
+
+/// 1 if cursor is over a dvui floating window (so events should be
+/// consumed instead of passed through to the underlying area).
+export fn dvui_cursor_over_floating(ctx: *Ctx) c_int {
+    return if (ctx.window.cursorRequestedFloating() != null) 1 else 0;
 }
 
 export fn dvui_frame(ctx: *Ctx) c_int {
     ctx.window.begin(std.time.nanoTimestamp()) catch return -1;
-    sample_app.frame() catch return -2;
+    app.frame() catch return -2;
     _ = ctx.window.end(.{}) catch return -3;
     return 0;
 }
