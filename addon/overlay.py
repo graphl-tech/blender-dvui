@@ -55,6 +55,11 @@ _VTX_DTYPE = np.dtype([
 _EVENT_LOG_PATH = os.environ.get("BLENDER_DVUI_EVENT_LOG")
 _event_log_file = None
 
+# DVUI expresses scroll wheel input in pixels. Other backends (SDL,
+# GLFW, …) multiply each OS wheel notch by `dvui.scroll_speed` (default
+# 80). Match that here so wheel zoom feels normal instead of glacial.
+_WHEEL_TICKS_PER_NOTCH: float = 80.0
+
 
 def _event_log(line: str) -> None:
     global _event_log_file
@@ -426,7 +431,7 @@ class DvuiSession:
 
     # --- input forwarding ---
 
-    def forward_event(self, region, event, cursor_in_area: bool) -> bool:
+    def forward_event(self, region, event, cursor_in_region: bool) -> bool:
         """Push a Blender event to DVUI. Returns True if dvui consumed it.
 
         Coordinates are computed from `event.mouse_x/y - region.x/y`
@@ -435,10 +440,10 @@ class DvuiSession:
         `mouse_region_x` reflects whatever region the event happened to
         come from, breaking ongoing drags).
 
-        ``cursor_in_area`` lets us gate button presses (we only want to
-        feed dvui presses that originated inside our area, otherwise
-        clicks on Blender's own UI — workspace tabs, the Outliner, etc.
-        — get hijacked by dvui's focus/capture machinery).
+        ``cursor_in_region`` is true only when the cursor sits inside
+        the editor's WINDOW region — the canvas dvui draws into. The
+        area's header strip (View/Select/Add/Node) and corner-split
+        handles fall outside, so events there pass through to Blender.
         """
         if not self.running or self.ctx is None:
             return False
@@ -469,10 +474,11 @@ class DvuiSession:
         if et in {"LEFTMOUSE", "RIGHTMOUSE", "MIDDLEMOUSE"}:
             button = {"LEFTMOUSE": 0, "MIDDLEMOUSE": 1, "RIGHTMOUSE": 2}[et]
             if ev == "PRESS":
-                # Don't hand dvui presses that started outside our
-                # area (workspace tabs / Outliner / Properties etc.)
-                # — let Blender handle them.
-                if not cursor_in_area:
+                # Don't hand dvui presses that started outside the
+                # WINDOW region (header menus, area split handles,
+                # workspace tabs, Outliner, Properties etc.) — let
+                # Blender handle them.
+                if not cursor_in_region:
                     return False
                 self._buttons_held.add(button)
                 self.native.lib.dvui_event_mouse_motion(self.ctx, x, y)
@@ -495,14 +501,18 @@ class DvuiSession:
             return False  # CLICK / CLICK_DRAG / DOUBLE_CLICK
 
         if et == "WHEELUPMOUSE":
-            if not cursor_in_area:
+            if not cursor_in_region:
                 return False
-            handled = self.native.lib.dvui_event_mouse_wheel(self.ctx, 0.0, 1.0)
+            handled = self.native.lib.dvui_event_mouse_wheel(
+                self.ctx, 0.0, _WHEEL_TICKS_PER_NOTCH
+            )
             return bool(handled)
         if et == "WHEELDOWNMOUSE":
-            if not cursor_in_area:
+            if not cursor_in_region:
                 return False
-            handled = self.native.lib.dvui_event_mouse_wheel(self.ctx, 0.0, -1.0)
+            handled = self.native.lib.dvui_event_mouse_wheel(
+                self.ctx, 0.0, -_WHEEL_TICKS_PER_NOTCH
+            )
             return bool(handled)
 
         # Special key?
@@ -737,12 +747,16 @@ def make_addon(
             if region is None:
                 return {"PASS_THROUGH"}
 
-            cursor_in_area = (
-                area.x <= event.mouse_x <= area.x + area.width
-                and area.y <= event.mouse_y <= area.y + area.height
+            # Use the WINDOW region's bounds, not the area's — the
+            # area includes the editor's header strip (View/Select/Add/
+            # Node) AND the area-split corner handles, which we want
+            # to leave to Blender.
+            cursor_in_region = (
+                region.x <= event.mouse_x <= region.x + region.width
+                and region.y <= event.mouse_y <= region.y + region.height
             )
 
-            handled = session.forward_event(region, event, cursor_in_area)
+            handled = session.forward_event(region, event, cursor_in_region)
             area.tag_redraw()
 
             if _EVENT_LOG_PATH is not None:
@@ -751,13 +765,14 @@ def make_addon(
                     f"win=({event.mouse_x},{event.mouse_y}) "
                     f"region=({event.mouse_x - region.x},"
                     f"{event.mouse_y - region.y}) "
-                    f"in_area={cursor_in_area} handled={handled}"
+                    f"in_region={cursor_in_region} handled={handled}"
                 )
 
-            # While the cursor is over our area, swallow right-click
-            # entirely so Blender's WM_OT_call_menu (the standard 3D
-            # viewport context menu) doesn't fire on top of dvui.
-            if event.type == "RIGHTMOUSE" and cursor_in_area:
+            # While the cursor is over our region (excluding the
+            # editor header / corner handles), swallow right-click
+            # entirely so Blender's context menu doesn't fire on top
+            # of dvui.
+            if event.type == "RIGHTMOUSE" and cursor_in_region:
                 return {"RUNNING_MODAL"}
 
             if handled:
