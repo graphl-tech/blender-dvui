@@ -393,6 +393,43 @@ templated `__init__.py`.
   manually (`backend_mod.addImport("dvui", dvui_mod); dvui_mod.addImport("backend", backend_mod);`)
 - Premultiplied alpha all the way through — `Color.PMA` is what DVUI
   hands us, Blender's `gpu.state.blend_set("ALPHA_PREMULT")` matches
-- A render-target texture path (`textureCreateTarget` etc.) is stubbed
-  out with `error.NotImplemented` / `error.TextureCreate`; widgets that
-  rely on it (e.g. `dvui.Picture`) won't work until that's added
+- For the data-flow diagram, struct layouts, and the rationale behind
+  the deferred-render split see [ARCHITECTURE.md](ARCHITECTURE.md)
+
+## Limitations
+
+* **No new editor type.** `bpy.types.Space` is C-registered and cannot
+  be subclassed from Python; the addon hosts dvui inside an existing
+  Space (`VIEW_3D`, `NODE_EDITOR`, `IMAGE_EDITOR`, …) selected by
+  `space_type`. In `NODE_EDITOR` we register a custom `NodeTree`
+  subclass so the area is at least recognizable in the tree-type
+  dropdown.
+* **Cdylib is not hot-reloadable.** Python's `ctypes.CDLL` keeps the
+  `.so` mapped for the life of the Blender process. Restart Blender
+  after `zig build`.
+* **One DVUI session per addon, one area per session.** The modal picks
+  the first matching area; multi-viewport setups only render in one of
+  them.
+* **Linux-tested only.** ctypes loader picks the right `dylib`/`dll`
+  suffix for macOS/Windows but nothing else has been exercised.
+* **Cdylib only — no staticlib path.**
+
+## Missing DVUI backend features
+
+| DVUI API                       | Status                                        |
+|--------------------------------|-----------------------------------------------|
+| `textureCreateTarget`          | stub returns `error.TextureCreate`            |
+| `textureClearTarget`           | no-op                                         |
+| `textureReadTarget`            | stub returns `error.TextureRead`              |
+| `textureFromTarget` / `textureFromTargetTemp` | stub returns `error.NotImplemented` |
+| `textureDestroyTarget`         | no-op                                         |
+| `renderTarget`                 | no-op (rendering always goes to Blender's framebuffer) |
+| `textureUpdateSubRect`         | not exposed                                   |
+| AccessKit                      | disabled (`.accesskit = .off`)                |
+| FreeType font rendering        | disabled — uses bundled `stb_truetype`        |
+| `tiny-file-dialogs`            | disabled — use `dvui.dialogNativeFile*` paths through Blender's own dialogs instead |
+| `tree-sitter`                  | disabled                                      |
+
+Widgets that rely on render-target textures (`dvui.Picture`, anything
+that does an offscreen pass) won't work until those backend hooks are
+implemented.
