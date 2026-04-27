@@ -1,0 +1,12 @@
+.{
+    .name = .blender_dvui_backend,
+    .version = "0.0.0",
+    .fingerprint = 0xaa747f2d635d6436,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
