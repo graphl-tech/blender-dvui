@@ -65,9 +65,6 @@ When Blender finishes loading:
    buttons (also: `bpy.ops.dvui_sample.stop()`).
 3. `bpy.ops.dvui_sample.start()` is automatically invoked from the test
    script ~1.5s after launch.
-4. `bpy.ops.dvui_sample.open_window()` opens a fresh Blender window
-   pre-running the DVUI app — same operator is also registered under
-   *Window > New DVUI Sample Window*.
 
 To drive it manually, start Blender normally and from the Python
 console:
@@ -249,24 +246,17 @@ zig-out/
 ```
 
 Drop that directory into Blender's `addons/` folder, then enable
-"My Awesome UI" in *Edit > Preferences > Add-ons*. Three operators are
-exposed:
+"My Awesome UI" in *Edit > Preferences > Add-ons*. The N-panel of the
+configured editor will gain a tab labeled with `app_name` and a
+start/stop button. `bpy.ops.<slug>.start()` / `<slug>.stop()` are the
+operator names.
 
-| Operator                       | What it does                                             |
-|--------------------------------|----------------------------------------------------------|
-| `bpy.ops.<slug>.start()`       | Modal: forward events to DVUI, render in current editor  |
-| `bpy.ops.<slug>.stop()`        | Stop a running session                                   |
-| `bpy.ops.<slug>.open_window()` | Create a dedicated new Blender window with the app inside |
-
-`open_window` is the closest thing to a "new editor type": Blender
-doesn't allow registering a brand-new `Space` from Python, but this
-operator duplicates the current window via `wm.window_new`, switches
-its largest area to the configured `space_type`, sets the area header
-text to `app_name` (so it visually reads as "the &lt;app&gt; editor"),
-and immediately starts the modal session inside it. The N-panel of
-the configured editor also gains a `<app_name>` tab with a start/stop
-button, and Blender's *Window* menu gets a "New &lt;app_name&gt;
-Window" entry that calls the same operator.
+> **Note: there is no truly new editor type.** Blender's Editor-Type
+> dropdown is C-registered and `bpy.types.Space` is not subclassable
+> from Python, so any Python addon — this one included — has to host
+> its UI inside an existing Space (`VIEW_3D`, `IMAGE_EDITOR`, …) via a
+> `draw_handler_add` POST_PIXEL hook plus a modal operator for
+> input. `space_type` selects which one.
 
 ### Run a built addon without installing
 
@@ -282,12 +272,20 @@ zig build blender-addon
 BLENDER_USER_SCRIPTS=$PWD/zig-out/scripts \
     blender --addons my_awesome_ui
 
-# Auto-start in a fresh dedicated Blender window:
+# Auto-start in the existing 3D viewport (or whichever space_type
+# was passed to buildBlenderAddon):
 BLENDER_USER_SCRIPTS=$PWD/zig-out/scripts \
     blender --addons my_awesome_ui \
-    --python-expr "import bpy; bpy.app.timers.register(\
-        lambda: (bpy.ops.my_awesome_ui.open_window(), None)[1], \
-        first_interval=1.0)"
+    --python-expr "
+import bpy
+def _start():
+    win = bpy.context.window_manager.windows[0]
+    area = next(a for a in win.screen.areas if a.type == 'VIEW_3D')
+    region = next(r for r in area.regions if r.type == 'WINDOW')
+    with bpy.context.temp_override(window=win, area=area, region=region):
+        bpy.ops.my_awesome_ui.start('INVOKE_DEFAULT')
+bpy.app.timers.register(_start, first_interval=1.0)
+"
 ```
 
 `bpy.context.preferences.addons.keys()` only lists *persistently*

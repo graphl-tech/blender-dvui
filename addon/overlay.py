@@ -164,14 +164,6 @@ class DvuiSession:
             self.native.lib.dvui_destroy(self.ctx)
             self.ctx = None
         self.textures.clear()
-        # Clear any header-text label we set when the session started.
-        try:
-            for win in bpy.context.window_manager.windows:
-                for area in win.screen.areas:
-                    if area.type == self.space_type:
-                        area.header_text_set(None)
-        except Exception:
-            pass
         self.running = False
         self.stop_requested = True
 
@@ -324,14 +316,24 @@ class DvuiSession:
     # --- input forwarding ---
 
     def forward_event(self, region, event) -> bool:
-        """Push a Blender event to DVUI. Returns True if dvui consumed it."""
+        """Push a Blender event to DVUI. Returns True if dvui consumed it.
+
+        Coordinates are computed from `event.mouse_x/y - region.x/y`
+        rather than `event.mouse_region_x/y`, so they remain correct
+        when the cursor leaves the region during a drag (otherwise
+        `mouse_region_x` reflects whatever region the event happened to
+        come from, breaking ongoing drags).
+        """
         if not self.running or self.ctx is None:
             return False
 
-        # DVUI uses top-left origin pixel coords; Blender's mouse_region_y
-        # is bottom-up.
-        x = float(event.mouse_region_x)
-        y = float(region.height - 1 - event.mouse_region_y)
+        # DVUI uses top-left origin pixel coords; Blender's window/region
+        # coordinates use bottom-left origin. Compute relative to the
+        # provided region without trusting Blender's per-event region.
+        rx = event.mouse_x - region.x
+        ry = event.mouse_y - region.y
+        x = float(rx)
+        y = float(region.height - 1 - ry)
         self.last_pixel = (int(x), int(y))
 
         et = event.type
@@ -404,20 +406,11 @@ class Addon:
     space_type: str
     classes: tuple
     session: DvuiSession
-    _menu_func: object = None
     _load_pre_handler: object = None
 
     def register(self) -> None:
         for c in self.classes:
             bpy.utils.register_class(c)
-
-        # Append our "New <App> Window" entry to Blender's Window menu
-        # so users get a familiar discovery path.
-        if self._menu_func is not None:
-            try:
-                bpy.types.TOPBAR_MT_window.append(self._menu_func)
-            except Exception:
-                pass
 
         # Tell DVUI the app is quitting before Blender swaps the
         # current scene out from under us, so close handlers can run.
@@ -439,19 +432,6 @@ class Addon:
             except ValueError:
                 pass
             self._load_pre_handler = None
-        if self._menu_func is not None:
-            try:
-                bpy.types.TOPBAR_MT_window.remove(self._menu_func)
-            except Exception:
-                pass
-        # Clear header-text labels we may have set on areas of our type.
-        try:
-            for win in bpy.context.window_manager.windows:
-                for area in win.screen.areas:
-                    if area.type == self.space_type:
-                        area.header_text_set(None)
-        except Exception:
-            pass
         for c in reversed(self.classes):
             try:
                 bpy.utils.unregister_class(c)
@@ -463,9 +443,6 @@ class Addon:
 
     def stop(self) -> None:
         bpy.ops.__getattr__(self.slug).stop()
-
-    def open_window(self) -> None:
-        bpy.ops.__getattr__(self.slug).open_window()
 
 
 def make_addon(
@@ -538,42 +515,45 @@ def make_addon(
                 self._cleanup(ctx)
                 return {"CANCELLED"}
 
-            # Find the region the cursor is in within an area of our space.
-            region = None
-            area_in = None
-            for area in ctx.window.screen.areas:
-                if area.type != space_type:
-                    continue
-                if not (
-                    area.x <= event.mouse_x <= area.x + area.width
-                    and area.y <= event.mouse_y <= area.y + area.height
-                ):
-                    continue
-                area_in = area
-                for r in area.regions:
-                    if r.type != "WINDOW":
-                        continue
-                    if (
-                        r.x <= event.mouse_x <= r.x + r.width
-                        and r.y <= event.mouse_y <= r.y + r.height
-                    ):
-                        region = r
-                        break
-                break
-
             if event.type == "TIMER":
-                # Periodic redraw so animations & blinking caret advance.
                 for area in ctx.window.screen.areas:
                     if area.type == space_type:
                         area.tag_redraw()
                 return {"PASS_THROUGH"}
 
-            if region is not None:
-                handled = session.forward_event(region, event)
-                if area_in is not None:
-                    area_in.tag_redraw()
-                if handled:
-                    return {"RUNNING_MODAL"}
+            # Pick the first area of our type. We forward events to it
+            # unconditionally — even when the cursor is currently in a
+            # different area — so an in-progress drag doesn't starve
+            # when the user pulls the floating window title past the
+            # area boundary.
+            area = next(
+                (a for a in ctx.window.screen.areas if a.type == space_type),
+                None,
+            )
+            if area is None:
+                return {"PASS_THROUGH"}
+            region = next(
+                (r for r in area.regions if r.type == "WINDOW"), None
+            )
+            if region is None:
+                return {"PASS_THROUGH"}
+
+            handled = session.forward_event(region, event)
+            area.tag_redraw()
+
+            cursor_in_area = (
+                area.x <= event.mouse_x <= area.x + area.width
+                and area.y <= event.mouse_y <= area.y + area.height
+            )
+
+            # While the cursor is over our area, swallow right-click
+            # entirely so Blender's WM_OT_call_menu (the standard 3D
+            # viewport context menu) doesn't fire on top of dvui.
+            if event.type == "RIGHTMOUSE" and cursor_in_area:
+                return {"RUNNING_MODAL"}
+
+            if handled:
+                return {"RUNNING_MODAL"}
             return {"PASS_THROUGH"}
 
         def _cleanup(self, ctx):
@@ -620,88 +600,10 @@ def make_addon(
 
     _Panel.__name__ = f"{cap_slug.upper()}_PT_panel"
 
-    class _OpenWindow(Operator):
-        """Spawn a new Blender window dedicated to this DVUI app.
-
-        Blender doesn't let Python register brand-new editor types, so
-        this is the closest equivalent: it duplicates the current
-        window, switches its largest area to ``space_type``, and starts
-        the DVUI app modally inside it. The result is a floating
-        window that visually reads as "the <app_name> editor".
-        """
-
-        bl_idname = f"{slug}.open_window"
-        bl_label = f"New {app_name} Window"
-        bl_description = (
-            f"Open a new Blender window with {app_name} running in it"
-        )
-
-        def execute(self, ctx):
-            wm = ctx.window_manager
-            prior_ids = {id(w) for w in wm.windows}
-            try:
-                bpy.ops.wm.window_new()
-            except Exception as exc:
-                self.report({"ERROR"}, f"wm.window_new failed: {exc}")
-                return {"CANCELLED"}
-
-            new_win = next(
-                (w for w in wm.windows if id(w) not in prior_ids), None
-            )
-            if new_win is None:
-                self.report({"ERROR"}, "could not locate the new window")
-                return {"CANCELLED"}
-
-            # Pick (or convert) an area in the new window to render into.
-            area = next(
-                (a for a in new_win.screen.areas if a.type == space_type),
-                None,
-            )
-            if area is None:
-                area = max(
-                    new_win.screen.areas,
-                    key=lambda a: a.width * a.height,
-                )
-                try:
-                    area.type = space_type
-                except Exception as exc:
-                    self.report(
-                        {"ERROR"},
-                        f"could not set area type to {space_type}: {exc}",
-                    )
-                    return {"CANCELLED"}
-
-            region = next(
-                (r for r in area.regions if r.type == "WINDOW"), None
-            )
-            try:
-                with ctx.temp_override(
-                    window=new_win, area=area, region=region
-                ):
-                    bpy.ops.__getattr__(slug).start("INVOKE_DEFAULT")
-            except Exception as exc:
-                self.report({"ERROR"}, f"start failed: {exc}")
-                return {"CANCELLED"}
-
-            # Header text label gives the area visual identity. Cleared
-            # by stop / unregister via the same hook.
-            try:
-                area.header_text_set(app_name)
-            except Exception:
-                pass
-
-            return {"FINISHED"}
-
-    _OpenWindow.__name__ = f"{cap_slug.upper()}_OT_open_window"
-
-    def _menu_func(self, _ctx):
-        self.layout.operator(_OpenWindow.bl_idname, icon="WINDOW")
-
     return Addon(
         app_name=app_name,
         slug=slug,
         space_type=space_type,
-        classes=(_Start, _Stop, _Panel, _OpenWindow),
+        classes=(_Start, _Stop, _Panel),
         session=session,
-        _menu_func=_menu_func,
     )
