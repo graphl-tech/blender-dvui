@@ -6,5 +6,8 @@ zig-out
 zig-pkg
 .zig-cache
 
+# test output
+scripts/out/*
+
 # python
 __pycache__

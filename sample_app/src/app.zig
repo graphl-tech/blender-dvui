@@ -23,7 +23,7 @@ pub fn frame() !void {
     });
     defer box.deinit();
 
-    dvui.label(@src(), "Hello from DVUI!", .{}, .{});
+    dvui.label(@src(), "'ello from DVUI!", .{}, .{});
 
     var click_buf: [64]u8 = undefined;
     const click_text = std.fmt.bufPrint(&click_buf, "Clicks: {d}", .{click_count}) catch "Clicks: ?";
