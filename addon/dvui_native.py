@@ -84,6 +84,29 @@ MOD_CTRL = 1 << 1
 MOD_ALT = 1 << 2
 MOD_CMD = 1 << 3
 
+# Mapping from dvui.Cursor enum (matches order in
+# `~/opensource/dvui/src/enums.zig::Cursor`) to Blender's
+# `Window.cursor_set` enum. Use a string Blender doesn't recognize?
+# `cursor_set` raises, so each entry must be one of the supported
+# values: DEFAULT / NONE / WAIT / CROSSHAIR / TEXT / HAND / SCROLL_X /
+# SCROLL_Y / SCROLL_XY / KNIFE / EYEDROPPER / etc.
+DVUI_CURSOR_TO_BLENDER: tuple[str, ...] = (
+    "DEFAULT",     # 0  arrow
+    "TEXT",        # 1  ibeam
+    "WAIT",        # 2  wait
+    "WAIT",        # 3  wait_arrow
+    "CROSSHAIR",   # 4  crosshair
+    "SCROLL_XY",   # 5  arrow_nw_se  (diag resize, no exact match)
+    "SCROLL_XY",   # 6  arrow_ne_sw  (other diag resize)
+    "MOVE_X",      # 7  arrow_w_e    (horizontal resize)
+    "MOVE_Y",      # 8  arrow_n_s    (vertical resize)
+    "SCROLL_XY",   # 9  arrow_all    (move all)
+    "STOP",        # 10 bad
+    "HAND",        # 11 hand
+    "NONE",        # 12 hidden
+)
+
+
 # Map Blender event.type for special keys.
 BLENDER_KEY_TO_CODE = {
     "BACK_SPACE": KEY_BACKSPACE,
@@ -186,6 +209,7 @@ def _bind(lib: C.CDLL) -> None:
     s("dvui_event_app_quit", [C.c_void_p], None)
     s("dvui_cursor_over_floating", [C.c_void_p], C.c_int)
     s("dvui_text_input_active", [C.c_void_p], C.c_int)
+    s("dvui_cursor_requested", [C.c_void_p], C.c_int)
 
     s("dvui_frame", [C.c_void_p], C.c_int)
 

@@ -327,6 +327,31 @@ class DvuiSession:
 
         self._sync_textures()
         self._render()
+        self._sync_cursor(ctx)
+
+    def _sync_cursor(self, ctx) -> None:
+        """Forward dvui's cursor request to the Blender window. Only
+        active while the cursor is inside the editor's WINDOW region —
+        otherwise we'd fight with Blender's own cursors over the
+        header / sidebar / other areas.
+        """
+        win = ctx.window
+        region = ctx.region
+        if win is None or region is None:
+            return
+        # We don't have event.mouse_x here; use the last cursor
+        # position dvui saw via forward_event.
+        last_x, last_y = self.last_pixel
+        in_region = 0 <= last_x < region.width and 0 <= last_y < region.height
+        if not in_region:
+            return
+        idx = self.native.lib.dvui_cursor_requested(self.ctx)
+        cursors = dvui_native.DVUI_CURSOR_TO_BLENDER
+        if 0 <= idx < len(cursors):
+            try:
+                win.cursor_set(cursors[idx])
+            except Exception:
+                pass
 
     def _render(self) -> None:
         n_v = C.c_uint32()

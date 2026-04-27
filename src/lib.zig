@@ -265,6 +265,15 @@ export fn dvui_text_input_active(ctx: *Ctx) c_int {
     return if (ctx.window.textInputRequested() != null) 1 else 0;
 }
 
+/// Returns the cursor dvui currently wants the host to display, as a
+/// stable integer indexing the Cursor enum:
+///   0=arrow 1=ibeam 2=wait 3=wait_arrow 4=crosshair
+///   5=arrow_nw_se 6=arrow_ne_sw 7=arrow_w_e 8=arrow_n_s
+///   9=arrow_all 10=bad 11=hand 12=hidden
+export fn dvui_cursor_requested(ctx: *Ctx) c_int {
+    return @intFromEnum(ctx.window.cursorRequested());
+}
+
 /// Tell DVUI that text from `start` to `end` should be selected in the
 /// currently focused widget. `start` and `end` are byte offsets.
 export fn dvui_event_text_select(ctx: *Ctx, start: u32, end: u32) c_int {
