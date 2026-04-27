@@ -36,11 +36,20 @@ from typing import Optional
 
 import bpy
 import gpu
+import numpy as np
 from bpy.types import Operator, Panel
-from gpu_extras.batch import batch_for_shader
 from mathutils import Matrix
 
 from . import dvui_native
+
+
+# Numpy structured dtype matching the layout of `Vertex` in
+# backend/src/backend.zig (8 bytes pos, 8 bytes uv, 4 bytes RGBA).
+_VTX_DTYPE = np.dtype([
+    ("x", "<f4"), ("y", "<f4"),
+    ("u", "<f4"), ("v", "<f4"),
+    ("r", "u1"), ("g", "u1"), ("b", "u1"), ("a", "u1"),
+])
 
 
 _EVENT_LOG_PATH = os.environ.get("BLENDER_DVUI_EVENT_LOG")
@@ -91,6 +100,7 @@ void main() {
 
 
 _shader_cache: dict[int, gpu.types.GPUShader] = {}
+_vbo_format_cache: dict[int, gpu.types.GPUVertFormat] = {}
 _white_cache: dict[int, gpu.types.GPUTexture] = {}
 
 
@@ -117,6 +127,26 @@ def _get_shader() -> gpu.types.GPUShader:
     sh = gpu.shader.create_from_info(info)
     _shader_cache[key] = sh
     return sh
+
+
+def _get_vbo_format(shader) -> gpu.types.GPUVertFormat:
+    """Manually built VertFormat that matches the shader's vertex_in
+    declarations. ``shader.format_calc()`` returns a format whose
+    attribute names don't always match the source ('pos'/'uv'/'col'),
+    so we construct one ourselves and use the same names we wrote in
+    the shader info.
+    """
+    key = 0
+    cached = _vbo_format_cache.get(key)
+    if cached is not None:
+        return cached
+    fmt = gpu.types.GPUVertFormat()
+    fmt.attr_add(id="pos", comp_type="F32", len=2, fetch_mode="FLOAT")
+    fmt.attr_add(id="uv", comp_type="F32", len=2, fetch_mode="FLOAT")
+    fmt.attr_add(id="col", comp_type="F32", len=4, fetch_mode="FLOAT")
+    _vbo_format_cache[key] = fmt
+    _ = shader  # kept for future caching by shader id
+    return fmt
 
 
 def _get_white() -> gpu.types.GPUTexture:
@@ -241,8 +271,16 @@ class DvuiSession:
             for i in range(n):
                 info = creates[i]
                 size = info.width * info.height * 4
-                pixel_bytes = C.string_at(info.pixels, size)
-                buf = gpu.types.Buffer("FLOAT", size, [b / 255.0 for b in pixel_bytes])
+                # Vectorized byte → float; the old list-comprehension
+                # path was ~50ms for a 512² font atlas.
+                src = np.frombuffer(
+                    (C.c_ubyte * size).from_address(
+                        C.cast(info.pixels, C.c_void_p).value
+                    ),
+                    dtype=np.uint8,
+                )
+                floats = src.astype(np.float32) * np.float32(1.0 / 255.0)
+                buf = gpu.types.Buffer("FLOAT", size, floats.tolist())
                 tex = gpu.types.GPUTexture(
                     size=(info.width, info.height), format="RGBA8", data=buf
                 )
@@ -282,26 +320,60 @@ class DvuiSession:
         n_v = C.c_uint32()
         n_i = C.c_uint32()
         n_c = C.c_uint32()
-        verts = self.native.lib.dvui_vertices(self.ctx, C.byref(n_v))
-        inds = self.native.lib.dvui_indices(self.ctx, C.byref(n_i))
-        cmds = self.native.lib.dvui_commands(self.ctx, C.byref(n_c))
-        if n_c.value == 0:
+        verts_ptr = self.native.lib.dvui_vertices(self.ctx, C.byref(n_v))
+        inds_ptr = self.native.lib.dvui_indices(self.ctx, C.byref(n_i))
+        cmds_ptr = self.native.lib.dvui_commands(self.ctx, C.byref(n_c))
+        v_count = n_v.value
+        i_count = n_i.value
+        c_count = n_c.value
+        if c_count == 0 or v_count == 0:
             return
 
         shader = _get_shader()
         white = _get_white()
-
-        v_count = n_v.value
-        positions = [None] * v_count
-        uvs = [None] * v_count
-        colors = [None] * v_count
-        for k in range(v_count):
-            v = verts[k]
-            positions[k] = (v.x, v.y)
-            uvs[k] = (v.u, v.v)
-            colors[k] = (v.r / 255.0, v.g / 255.0, v.b / 255.0, v.a / 255.0)
-
         w, h = self.width, self.height
+
+        # Wrap the C vertex/index buffers as numpy views (zero-copy).
+        # Valid only until the next dvui_frame call; we consume them
+        # within this draw handler so that's fine.
+        vtx_addr = C.cast(verts_ptr, C.c_void_p).value
+        vtx_arr = np.frombuffer(
+            (C.c_ubyte * (v_count * _VTX_DTYPE.itemsize)).from_address(vtx_addr),
+            dtype=_VTX_DTYPE,
+        )
+
+        # Per-attribute float arrays. Vectorized byte→float beats the
+        # old per-vertex Python loop by ~100×.
+        positions = np.empty((v_count, 2), dtype=np.float32)
+        positions[:, 0] = vtx_arr["x"]
+        positions[:, 1] = vtx_arr["y"]
+
+        uvs = np.empty((v_count, 2), dtype=np.float32)
+        uvs[:, 0] = vtx_arr["u"]
+        uvs[:, 1] = vtx_arr["v"]
+
+        colors = np.empty((v_count, 4), dtype=np.float32)
+        colors[:, 0] = vtx_arr["r"]
+        colors[:, 1] = vtx_arr["g"]
+        colors[:, 2] = vtx_arr["b"]
+        colors[:, 3] = vtx_arr["a"]
+        colors *= np.float32(1.0 / 255.0)
+
+        inds_addr = C.cast(inds_ptr, C.c_void_p).value
+        indices_flat = np.frombuffer(
+            (C.c_ubyte * (i_count * 4)).from_address(inds_addr),
+            dtype=np.uint32,
+        )
+
+        # Build the shared vertex buffer once per frame. All draw
+        # commands below reference this same VBO via their own (small)
+        # IndexBuf — we avoid re-uploading the vertex stream N times.
+        fmt = _get_vbo_format(shader)
+        vbo = gpu.types.GPUVertBuf(fmt, v_count)
+        vbo.attr_fill("pos", positions)
+        vbo.attr_fill("uv", uvs)
+        vbo.attr_fill("col", colors)
+
         proj = Matrix((
             (2.0 / w, 0.0, 0.0, -1.0),
             (0.0, -2.0 / h, 0.0, 1.0),
@@ -321,8 +393,8 @@ class DvuiSession:
         shader.uniform_float("ProjMtx", proj)
 
         try:
-            for k in range(n_c.value):
-                cmd = cmds[k]
+            for k in range(c_count):
+                cmd = cmds_ptr[k]
                 if cmd.idx_count == 0:
                     continue
                 if cmd.has_clip:
@@ -334,18 +406,11 @@ class DvuiSession:
                 tex = self.textures.get(cmd.texture_id, white)
                 shader.uniform_sampler("tex", tex)
 
-                start = cmd.idx_offset
-                end = start + cmd.idx_count
-                indices = [
-                    (inds[start + 3 * t], inds[start + 3 * t + 1], inds[start + 3 * t + 2])
-                    for t in range((end - start) // 3)
-                ]
-                batch = batch_for_shader(
-                    shader,
-                    "TRIS",
-                    {"pos": positions, "uv": uvs, "col": colors},
-                    indices=indices,
-                )
+                cmd_indices = indices_flat[
+                    cmd.idx_offset : cmd.idx_offset + cmd.idx_count
+                ].reshape(-1, 3)
+                ibo = gpu.types.GPUIndexBuf(type="TRIS", seq=cmd_indices)
+                batch = gpu.types.GPUBatch(type="TRIS", buf=vbo, elem=ibo)
                 batch.draw(shader)
         finally:
             gpu.state.blend_set(prev_blend)
