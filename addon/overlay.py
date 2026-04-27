@@ -205,6 +205,13 @@ class DvuiSession:
     running: bool = False
     stop_requested: bool = False
 
+    # Set of mouse button indices (0=left, 1=middle, 2=right) whose
+    # PRESS we've forwarded to dvui. Tracked so we can also forward
+    # the matching RELEASE — even if it happens after the cursor has
+    # left our area — without forwarding off-area presses that don't
+    # belong to dvui.
+    _buttons_held: set = field(default_factory=set)
+
     # --- lifecycle ---
 
     def start(self) -> None:
@@ -419,7 +426,7 @@ class DvuiSession:
 
     # --- input forwarding ---
 
-    def forward_event(self, region, event) -> bool:
+    def forward_event(self, region, event, cursor_in_area: bool) -> bool:
         """Push a Blender event to DVUI. Returns True if dvui consumed it.
 
         Coordinates are computed from `event.mouse_x/y - region.x/y`
@@ -427,6 +434,11 @@ class DvuiSession:
         when the cursor leaves the region during a drag (otherwise
         `mouse_region_x` reflects whatever region the event happened to
         come from, breaking ongoing drags).
+
+        ``cursor_in_area`` lets us gate button presses (we only want to
+        feed dvui presses that originated inside our area, otherwise
+        clicks on Blender's own UI — workspace tabs, the Outliner, etc.
+        — get hijacked by dvui's focus/capture machinery).
         """
         if not self.running or self.ctx is None:
             return False
@@ -451,31 +463,45 @@ class DvuiSession:
         # Mouse-button events from Blender carry several `value`s:
         # PRESS, RELEASE, CLICK, CLICK_DRAG, DOUBLE_CLICK. Only forward
         # PRESS and RELEASE — the synthetic CLICK / CLICK_DRAG /
-        # DOUBLE_CLICK events fire IN ADDITION to the underlying PRESS
-        # and RELEASE, and treating CLICK_DRAG as "not press" would
-        # send dvui a spurious RELEASE that kills any in-progress drag.
+        # DOUBLE_CLICK fire IN ADDITION to the underlying PRESS/RELEASE,
+        # and treating CLICK_DRAG as "not press" would send dvui a
+        # spurious RELEASE that kills any in-progress drag.
         if et in {"LEFTMOUSE", "RIGHTMOUSE", "MIDDLEMOUSE"}:
             button = {"LEFTMOUSE": 0, "MIDDLEMOUSE": 1, "RIGHTMOUSE": 2}[et]
             if ev == "PRESS":
+                # Don't hand dvui presses that started outside our
+                # area (workspace tabs / Outliner / Properties etc.)
+                # — let Blender handle them.
+                if not cursor_in_area:
+                    return False
+                self._buttons_held.add(button)
                 self.native.lib.dvui_event_mouse_motion(self.ctx, x, y)
                 handled = self.native.lib.dvui_event_mouse_button(
                     self.ctx, button, 1
                 )
                 return bool(handled)
             if ev == "RELEASE":
+                # Forward the release if we forwarded the matching
+                # press — even when the cursor has since left our
+                # area, so a drag that started inside dvui can finish
+                # cleanly anywhere.
+                if button not in self._buttons_held:
+                    return False
+                self._buttons_held.discard(button)
                 handled = self.native.lib.dvui_event_mouse_button(
                     self.ctx, button, 0
                 )
                 return bool(handled)
-            # CLICK / CLICK_DRAG / DOUBLE_CLICK — Blender's synthetic
-            # higher-level events; ignore (dvui already saw the
-            # underlying PRESS/RELEASE).
-            return False
+            return False  # CLICK / CLICK_DRAG / DOUBLE_CLICK
 
         if et == "WHEELUPMOUSE":
+            if not cursor_in_area:
+                return False
             handled = self.native.lib.dvui_event_mouse_wheel(self.ctx, 0.0, 1.0)
             return bool(handled)
         if et == "WHEELDOWNMOUSE":
+            if not cursor_in_area:
+                return False
             handled = self.native.lib.dvui_event_mouse_wheel(self.ctx, 0.0, -1.0)
             return bool(handled)
 
@@ -493,6 +519,15 @@ class DvuiSession:
             handled |= self.native.lib.dvui_event_text(
                 self.ctx, data, len(data)
             )
+
+        # While DVUI has a text-input widget asking for keyboard focus,
+        # consume *every* key/text event so Blender hotkeys (Q, G, R,
+        # etc.) don't fire for keystrokes the user is typing. Without
+        # this dvui's per-event "handled" return is too narrow — it
+        # only marks events that landed in a focused subwindow, not
+        # ones consumed by the focused widget itself.
+        if self.native.lib.dvui_text_input_active(self.ctx):
+            handled = 1
 
         return bool(handled)
 
@@ -702,13 +737,13 @@ def make_addon(
             if region is None:
                 return {"PASS_THROUGH"}
 
-            handled = session.forward_event(region, event)
-            area.tag_redraw()
-
             cursor_in_area = (
                 area.x <= event.mouse_x <= area.x + area.width
                 and area.y <= event.mouse_y <= area.y + area.height
             )
+
+            handled = session.forward_event(region, event, cursor_in_area)
+            area.tag_redraw()
 
             if _EVENT_LOG_PATH is not None:
                 _event_log(

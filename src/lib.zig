@@ -258,6 +258,13 @@ export fn dvui_cursor_over_floating(ctx: *Ctx) c_int {
     return if (ctx.window.cursorRequestedFloating() != null) 1 else 0;
 }
 
+/// 1 when dvui has an active text input widget asking for keyboard
+/// focus. Use this to suppress host-app hotkeys while typing into a
+/// dvui text field.
+export fn dvui_text_input_active(ctx: *Ctx) c_int {
+    return if (ctx.window.textInputRequested() != null) 1 else 0;
+}
+
 /// Tell DVUI that text from `start` to `end` should be selected in the
 /// currently focused widget. `start` and `end` are byte offsets.
 export fn dvui_event_text_select(ctx: *Ctx, start: u32, end: u32) c_int {

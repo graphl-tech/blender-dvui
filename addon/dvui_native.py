@@ -185,6 +185,7 @@ def _bind(lib: C.CDLL) -> None:
     s("dvui_event_window_close", [C.c_void_p], None)
     s("dvui_event_app_quit", [C.c_void_p], None)
     s("dvui_cursor_over_floating", [C.c_void_p], C.c_int)
+    s("dvui_text_input_active", [C.c_void_p], C.c_int)
 
     s("dvui_frame", [C.c_void_p], C.c_int)
 
