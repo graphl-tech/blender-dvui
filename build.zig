@@ -103,6 +103,26 @@ pub const BlenderAddonOptions = struct {
     optimize: std.builtin.OptimizeMode,
 };
 
+pub const BlenderAddon = struct {
+    /// Top-level step that, once depended on, builds the cdylib and
+    /// installs all four files into the addon directory. Hang it off
+    /// `b.getInstallStep()` to make `zig build` build the addon by
+    /// default, or off your own custom step (e.g.
+    /// `b.step("blender-addon", "...")`) to gate it.
+    step: *std.Build.Step,
+
+    /// The cdylib's compile step, exposed so callers can tweak it
+    /// further (extra C sources, system libraries, etc.).
+    lib: *std.Build.Step.Compile,
+
+    /// Final relative path inside the install prefix, e.g.
+    /// `"blender_addon/my_app"`.
+    install_subdir: []const u8,
+
+    /// Slug used for the operator namespace and cdylib filename.
+    slug: []const u8,
+};
+
 /// Build a complete Blender addon for a DVUI app.
 ///
 /// Produces, under `zig-out/<install_root>/<slug>/`:
@@ -114,7 +134,12 @@ pub const BlenderAddonOptions = struct {
 /// To install the resulting addon in Blender, copy the produced
 /// directory into Blender's `addons/` folder, then enable
 /// "<App Name>" in Edit > Preferences > Add-ons.
-pub fn buildBlenderAddon(b: *std.Build, opts: BlenderAddonOptions) void {
+///
+/// Returns a `BlenderAddon` whose `step` builds the addon when
+/// invoked. The function does NOT auto-attach to `b.getInstallStep()`
+/// — the caller decides whether to build by default or only via a
+/// dedicated step.
+pub fn buildBlenderAddon(b: *std.Build, opts: BlenderAddonOptions) BlenderAddon {
     const dep = opts.blender_dvui_dep;
     const backend_mod = dep.module("blender_backend");
 
@@ -148,7 +173,6 @@ pub fn buildBlenderAddon(b: *std.Build, opts: BlenderAddonOptions) void {
     const install_lib = b.addInstallArtifact(lib, .{
         .dest_dir = .{ .override = .{ .custom = subdir } },
     });
-    b.getInstallStep().dependOn(&install_lib.step);
 
     // Generate the per-app __init__.py.
     const init_py = b.fmt(
@@ -198,19 +222,36 @@ pub fn buildBlenderAddon(b: *std.Build, opts: BlenderAddonOptions) void {
 
     const wf = b.addWriteFiles();
     const init_path = wf.add("__init__.py", init_py);
-    b.getInstallStep().dependOn(&b.addInstallFile(
+    const install_init = b.addInstallFile(
         init_path,
         b.fmt("{s}/__init__.py", .{subdir}),
-    ).step);
-
-    b.getInstallStep().dependOn(&b.addInstallFile(
+    );
+    const install_native = b.addInstallFile(
         dep.path("addon/dvui_native.py"),
         b.fmt("{s}/dvui_native.py", .{subdir}),
-    ).step);
-    b.getInstallStep().dependOn(&b.addInstallFile(
+    );
+    const install_overlay = b.addInstallFile(
         dep.path("addon/overlay.py"),
         b.fmt("{s}/overlay.py", .{subdir}),
-    ).step);
+    );
+
+    const top = b.allocator.create(std.Build.Step) catch @panic("OOM");
+    top.* = std.Build.Step.init(.{
+        .id = .custom,
+        .name = b.fmt("blender-addon ({s})", .{slug}),
+        .owner = b,
+    });
+    top.dependOn(&install_lib.step);
+    top.dependOn(&install_init.step);
+    top.dependOn(&install_native.step);
+    top.dependOn(&install_overlay.step);
+
+    return .{
+        .step = top,
+        .lib = lib,
+        .install_subdir = subdir,
+        .slug = slug,
+    };
 }
 
 fn slugify(b: *std.Build, name: []const u8) []const u8 {

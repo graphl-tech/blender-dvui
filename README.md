@@ -65,6 +65,9 @@ When Blender finishes loading:
    buttons (also: `bpy.ops.dvui_sample.stop()`).
 3. `bpy.ops.dvui_sample.start()` is automatically invoked from the test
    script ~1.5s after launch.
+4. `bpy.ops.dvui_sample.open_window()` opens a fresh Blender window
+   pre-running the DVUI app — same operator is also registered under
+   *Window > New DVUI Sample Window*.
 
 To drive it manually, start Blender normally and from the Python
 console:
@@ -120,9 +123,20 @@ The sample UI lives in:
 sample_app/src/app.zig
 ```
 
-It exports a single `pub fn frame() !void`, which is called once per
-frame between `Window.begin` / `Window.end` by the integrator. Inside
-`frame()` you write normal DVUI code:
+A DVUI app exposes:
+
+```zig
+pub fn frame() !void;                  // required
+pub fn init(win: *dvui.Window) !void;  // optional, called once after Window.init
+pub fn deinit() void;                  // optional, called once before Window.deinit
+                                       //  (deinit may also be `!void`)
+```
+
+`frame()` is called once per overlay redraw between `Window.begin` and
+`Window.end`. `init` / `deinit` run outside any begin/end window pair —
+use them for any setup that allocates resources, parses CLI args, or
+otherwise can't be done inside a frame. Inside `frame()` you write
+normal DVUI code:
 
 ```zig
 pub fn frame() !void {
@@ -190,7 +204,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    blender_dvui.buildBlenderAddon(b, .{
+    const addon = blender_dvui.buildBlenderAddon(b, .{
         .blender_dvui_dep = blender_dep,
         .dvui_module = dvui_mod,
         .app_module = my_app,
@@ -199,8 +213,18 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Make `zig build` build the addon by default…
+    b.getInstallStep().dependOn(addon.step);
+    // …or gate it behind a custom step:
+    //   const blender_step = b.step("blender-addon", "Build addon");
+    //   blender_step.dependOn(addon.step);
 }
 ```
+
+`buildBlenderAddon` returns a `BlenderAddon` whose `.step` is the
+top-level step that triggers cdylib + Python file installation, and
+`.lib` is the cdylib `Compile` step (handy if you need to add C
+sources, link extra system libraries, etc.).
 
 `build.zig.zon` should pull in both `dvui` (with the same hash this
 repo uses; see `build.zig.zon`) and `blender_dvui` (path or url):
@@ -225,10 +249,58 @@ zig-out/
 ```
 
 Drop that directory into Blender's `addons/` folder, then enable
-"My Awesome UI" in *Edit > Preferences > Add-ons*. The N-panel of the
-configured editor will gain a tab labeled with `app_name` and a
-start/stop button. `bpy.ops.<slug>.start()` / `<slug>.stop()` are the
-operator names.
+"My Awesome UI" in *Edit > Preferences > Add-ons*. Three operators are
+exposed:
+
+| Operator                       | What it does                                             |
+|--------------------------------|----------------------------------------------------------|
+| `bpy.ops.<slug>.start()`       | Modal: forward events to DVUI, render in current editor  |
+| `bpy.ops.<slug>.stop()`        | Stop a running session                                   |
+| `bpy.ops.<slug>.open_window()` | Create a dedicated new Blender window with the app inside |
+
+`open_window` is the closest thing to a "new editor type": Blender
+doesn't allow registering a brand-new `Space` from Python, but this
+operator duplicates the current window via `wm.window_new`, switches
+its largest area to the configured `space_type`, sets the area header
+text to `app_name` (so it visually reads as "the &lt;app&gt; editor"),
+and immediately starts the modal session inside it. The N-panel of
+the configured editor also gains a `<app_name>` tab with a start/stop
+button, and Blender's *Window* menu gets a "New &lt;app_name&gt;
+Window" entry that calls the same operator.
+
+### Run a built addon without installing
+
+Blender will pick up addons from any `<scripts>/addons/<name>/` layout
+referenced via `BLENDER_USER_SCRIPTS`. If you set
+`install_root = "scripts/addons"` in the helper, the build output is
+already in that shape:
+
+```bash
+zig build blender-addon
+
+# Tell Blender where to find addons, enable for this session, run it:
+BLENDER_USER_SCRIPTS=$PWD/zig-out/scripts \
+    blender --addons my_awesome_ui
+
+# Auto-start in a fresh dedicated Blender window:
+BLENDER_USER_SCRIPTS=$PWD/zig-out/scripts \
+    blender --addons my_awesome_ui \
+    --python-expr "import bpy; bpy.app.timers.register(\
+        lambda: (bpy.ops.my_awesome_ui.open_window(), None)[1], \
+        first_interval=1.0)"
+```
+
+`bpy.context.preferences.addons.keys()` only lists *persistently*
+enabled addons (saved in user prefs); `--addons` enables for the
+current session only. Confirm enable-state with
+`addon_utils.check('my_awesome_ui')` returning `(True, True)`. To make
+the enable persist across launches:
+
+```bash
+blender -b --python-expr "import bpy; \
+    bpy.ops.preferences.addon_enable(module='my_awesome_ui'); \
+    bpy.ops.wm.save_userpref()"
+```
 
 The `space_type` parameter is one of the standard Blender editor enums
 (`"VIEW_3D"`, `"IMAGE_EDITOR"`, `"NODE_EDITOR"`, `"GRAPH_EDITOR"`,

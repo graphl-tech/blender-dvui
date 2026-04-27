@@ -53,10 +53,56 @@ export fn dvui_create(width: u32, height: u32) ?*Ctx {
         return null;
     };
 
+    // Optional one-shot app init, called after the dvui Window exists
+    // but before any frame. We expose `dvui.current_window` so init()
+    // can call dvui APIs that require it (theme setup, font loading,
+    // etc.) without needing a real frame's `Window.begin/end` pair.
+    if (@hasDecl(app, "init")) {
+        const InitFn = @TypeOf(app.init);
+        const init_info = @typeInfo(InitFn).@"fn";
+
+        const prev_current = dvui.current_window;
+        dvui.current_window = &ctx.window;
+        defer dvui.current_window = prev_current;
+
+        const res: anyerror!void = if (init_info.params.len == 1)
+            app.init(&ctx.window)
+        else if (init_info.params.len == 0)
+            app.init()
+        else
+            {};
+
+        res catch |err| {
+            std.log.err("dvui app init failed: {}", .{err});
+            ctx.window.deinit();
+            ctx.backend.deinit();
+            _ = ctx.gpa_state.deinit();
+            freeCtx(ctx);
+            return null;
+        };
+    }
+
     return ctx;
 }
 
 export fn dvui_destroy(ctx: *Ctx) void {
+    if (@hasDecl(app, "deinit")) {
+        const prev_current = dvui.current_window;
+        dvui.current_window = &ctx.window;
+        defer dvui.current_window = prev_current;
+
+        const DeinitFn = @TypeOf(app.deinit);
+        const dinfo = @typeInfo(DeinitFn).@"fn";
+        if (dinfo.return_type) |R| {
+            if (@typeInfo(R) == .error_union) {
+                app.deinit() catch |err| {
+                    std.log.err("dvui app deinit failed: {}", .{err});
+                };
+            } else {
+                app.deinit();
+            }
+        }
+    }
     ctx.window.deinit();
     ctx.backend.deinit();
     _ = ctx.gpa_state.deinit();
