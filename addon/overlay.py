@@ -1,5 +1,11 @@
 """Per-app DVUI overlay infrastructure.
 
+Setting the env var ``BLENDER_DVUI_EVENT_LOG=/path/to/log`` causes the
+modal operator to write every Blender event it processes to that file
+(type, value, mouse_x/y, region-relative coords, modifier state, and
+whether dvui consumed it). Useful to debug drag/click problems where
+the events flowing through the bridge differ from expectation.
+
 Use :func:`make_addon` to build a self-contained set of Blender classes
 (operators + panel) bound to a particular DVUI app and target editor
 (space) type. The same module backs both the bundled sample app and the
@@ -23,6 +29,7 @@ through a custom ``GPUShader``.
 from __future__ import annotations
 
 import ctypes as C
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Optional
@@ -36,6 +43,25 @@ from mathutils import Matrix
 from . import dvui_native
 
 
+_EVENT_LOG_PATH = os.environ.get("BLENDER_DVUI_EVENT_LOG")
+_event_log_file = None
+
+
+def _event_log(line: str) -> None:
+    global _event_log_file
+    if _EVENT_LOG_PATH is None:
+        return
+    if _event_log_file is None:
+        try:
+            _event_log_file = open(_EVENT_LOG_PATH, "w", buffering=1)
+        except Exception:
+            return
+    try:
+        _event_log_file.write(line + "\n")
+    except Exception:
+        pass
+
+
 VERTEX_SOURCE = """
 void main() {
     v_uv = uv;
@@ -45,8 +71,21 @@ void main() {
 """
 
 FRAGMENT_SOURCE = """
+// DVUI hands us premultiplied-alpha sRGB byte colors and an sRGB
+// texture. Blender's draw_handler framebuffer however expects scene-
+// linear, so writing the sRGB values directly produces washed-out
+// (too-bright) output. Convert to linear before writing. Mirrors the
+// same conversion BlenderImgui uses for the same reason.
+vec4 srgb_to_linear(vec4 c) {
+    vec3 lo = c.rgb / 12.92;
+    vec3 hi = pow((c.rgb + 0.055) / 1.055, vec3(2.4));
+    vec3 cutoff = step(c.rgb, vec3(0.04045));
+    return vec4(mix(hi, lo, cutoff), c.a);
+}
+
 void main() {
-    frag = v_col * texture(tex, v_uv);
+    vec4 c = v_col * texture(tex, v_uv);
+    frag = srgb_to_linear(c);
 }
 """
 
@@ -344,24 +383,29 @@ class DvuiSession:
             self.native.lib.dvui_event_mouse_motion(self.ctx, x, y)
             return False  # always pass through
 
-        if et == "LEFTMOUSE":
-            self.native.lib.dvui_event_mouse_motion(self.ctx, x, y)
-            handled = self.native.lib.dvui_event_mouse_button(
-                self.ctx, 0, 1 if ev == "PRESS" else 0
-            )
-            return bool(handled)
-
-        if et == "RIGHTMOUSE":
-            handled = self.native.lib.dvui_event_mouse_button(
-                self.ctx, 2, 1 if ev == "PRESS" else 0
-            )
-            return bool(handled)
-
-        if et == "MIDDLEMOUSE":
-            handled = self.native.lib.dvui_event_mouse_button(
-                self.ctx, 1, 1 if ev == "PRESS" else 0
-            )
-            return bool(handled)
+        # Mouse-button events from Blender carry several `value`s:
+        # PRESS, RELEASE, CLICK, CLICK_DRAG, DOUBLE_CLICK. Only forward
+        # PRESS and RELEASE — the synthetic CLICK / CLICK_DRAG /
+        # DOUBLE_CLICK events fire IN ADDITION to the underlying PRESS
+        # and RELEASE, and treating CLICK_DRAG as "not press" would
+        # send dvui a spurious RELEASE that kills any in-progress drag.
+        if et in {"LEFTMOUSE", "RIGHTMOUSE", "MIDDLEMOUSE"}:
+            button = {"LEFTMOUSE": 0, "MIDDLEMOUSE": 1, "RIGHTMOUSE": 2}[et]
+            if ev == "PRESS":
+                self.native.lib.dvui_event_mouse_motion(self.ctx, x, y)
+                handled = self.native.lib.dvui_event_mouse_button(
+                    self.ctx, button, 1
+                )
+                return bool(handled)
+            if ev == "RELEASE":
+                handled = self.native.lib.dvui_event_mouse_button(
+                    self.ctx, button, 0
+                )
+                return bool(handled)
+            # CLICK / CLICK_DRAG / DOUBLE_CLICK — Blender's synthetic
+            # higher-level events; ignore (dvui already saw the
+            # underlying PRESS/RELEASE).
+            return False
 
         if et == "WHEELUPMOUSE":
             handled = self.native.lib.dvui_event_mouse_wheel(self.ctx, 0.0, 1.0)
@@ -484,6 +528,25 @@ def make_addon(
 
     cap_slug = "".join(part.capitalize() for part in slug.split("_"))
 
+    # When hosting in a Node Editor, register a custom NodeTree
+    # subclass. It shows up in the Node Editor's tree-type dropdown
+    # alongside Shader / Geometry Nodes / Compositor, giving the area
+    # visible identity as "the <app_name> editor". Blender doesn't let
+    # Python register a true new Space type, but a NodeTree subclass is
+    # the closest approximation in NODE_EDITOR.
+    node_tree_idname = f"{cap_slug}NodeTree"
+    _NodeTree: Optional[type] = None
+    if space_type == "NODE_EDITOR":
+        from bpy.types import NodeTree
+
+        class _NodeTreeImpl(NodeTree):
+            bl_idname = node_tree_idname
+            bl_label = app_name
+            bl_icon = "NODETREE"
+
+        _NodeTreeImpl.__name__ = f"{cap_slug.upper()}_NodeTree"
+        _NodeTree = _NodeTreeImpl
+
     class _Start(Operator):
         bl_idname = f"{slug}.start"
         bl_label = f"Start {app_name}"
@@ -495,11 +558,47 @@ def make_addon(
             if session.running:
                 self.report({"WARNING"}, f"{app_name} already running")
                 return {"CANCELLED"}
+
+            # Make sure we have at least one area of the right type.
+            # If not, convert the area the operator was invoked from
+            # (or, failing that, the largest area in the window).
+            target_area = None
+            for area in ctx.window.screen.areas:
+                if area.type == space_type:
+                    target_area = area
+                    break
+            if target_area is None:
+                target_area = ctx.area or max(
+                    ctx.window.screen.areas,
+                    key=lambda a: a.width * a.height,
+                )
+                try:
+                    target_area.type = space_type
+                except Exception as exc:
+                    self.report(
+                        {"ERROR"},
+                        f"could not switch area to {space_type}: {exc}",
+                    )
+                    return {"CANCELLED"}
+
             try:
                 session.start()
             except Exception as exc:
                 self.report({"ERROR"}, f"failed to start: {exc}")
                 return {"CANCELLED"}
+
+            # If running in a Node Editor with our custom NodeTree
+            # registered, switch the active node space to use it so the
+            # area is visibly the "<app_name>" editor.
+            if space_type == "NODE_EDITOR" and _NodeTree is not None:
+                for area in ctx.window.screen.areas:
+                    if area.type != "NODE_EDITOR":
+                        continue
+                    space = area.spaces.active
+                    try:
+                        space.tree_type = node_tree_idname
+                    except Exception:
+                        pass
 
             wm = ctx.window_manager
             self._timer = wm.event_timer_add(1.0 / 60.0, window=ctx.window)
@@ -545,6 +644,15 @@ def make_addon(
                 area.x <= event.mouse_x <= area.x + area.width
                 and area.y <= event.mouse_y <= area.y + area.height
             )
+
+            if _EVENT_LOG_PATH is not None:
+                _event_log(
+                    f"{event.type:<14} {event.value:<8} "
+                    f"win=({event.mouse_x},{event.mouse_y}) "
+                    f"region=({event.mouse_x - region.x},"
+                    f"{event.mouse_y - region.y}) "
+                    f"in_area={cursor_in_area} handled={handled}"
+                )
 
             # While the cursor is over our area, swallow right-click
             # entirely so Blender's WM_OT_call_menu (the standard 3D
@@ -600,10 +708,16 @@ def make_addon(
 
     _Panel.__name__ = f"{cap_slug.upper()}_PT_panel"
 
+    classes: tuple = (_Start, _Stop, _Panel)
+    if _NodeTree is not None:
+        # Register first so the Node Editor sees the tree-type at the
+        # time _Start.invoke flips area.spaces.active.tree_type.
+        classes = (_NodeTree,) + classes
+
     return Addon(
         app_name=app_name,
         slug=slug,
         space_type=space_type,
-        classes=(_Start, _Stop, _Panel),
+        classes=classes,
         session=session,
     )
