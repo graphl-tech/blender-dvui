@@ -3,9 +3,9 @@ bl_info = {
     "author": "blender-dvui",
     "version": (0, 0, 1),
     "blender": (4, 0, 0),
-    "location": "View3D > Sidebar > DVUI Sample",
+    "location": "Node Editor > Sidebar > DVUI Sample",
     "description": "DVUI rendered into Blender via a Zig backend",
-    "category": "3D view",
+    "category": "Node",
 }
 
 from . import overlay
@@ -18,7 +18,10 @@ def register():
     global _addon
     _addon = overlay.make_addon(
         app_name="DVUI Sample",
-        space_type="VIEW_3D",
+        # Node Editor avoids the 3D viewport's gizmo / click-drag
+        # modals that fight with dvui's drag tracking, and gets a
+        # registered tree-type entry in the editor's dropdown.
+        space_type="NODE_EDITOR",
         slug="dvui_sample",
         lib_basename="libblender_dvui",
     )

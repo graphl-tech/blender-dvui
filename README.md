@@ -59,10 +59,12 @@ zig build && blender --python scripts/test_blender.py
 When Blender finishes loading:
 
 1. The script invokes `bpy.ops.dvui_sample.start("INVOKE_DEFAULT")`,
-   which is a *modal operator* — it both attaches a `SpaceView3D` draw
-   handler and forwards mouse / wheel / keyboard / text events to DVUI.
-2. The 3D viewport's N-panel gains a `DVUI Sample` tab with start/stop
-   buttons (also: `bpy.ops.dvui_sample.stop()`).
+   which is a *modal operator* — it converts the largest area to
+   `NODE_EDITOR` (the sample's configured space), attaches a draw
+   handler, and forwards mouse / wheel / keyboard / text events to
+   DVUI.
+2. The Node Editor's N-panel gains a `DVUI Sample` tab with
+   start/stop buttons (also: `bpy.ops.dvui_sample.stop()`).
 3. `bpy.ops.dvui_sample.start()` is automatically invoked from the test
    script ~1.5s after launch.
 
@@ -316,7 +318,7 @@ started, it forwards every Blender event to DVUI:
 |----------------------------|------------------------------------------------------------|
 | `MOUSEMOVE`                | `dvui_event_mouse_motion(x, y)` (top-left origin)         |
 | `LEFTMOUSE` / `RIGHT` / `MIDDLEMOUSE` | `dvui_event_mouse_button(button, pressed)`      |
-| `WHEELUP/DOWNMOUSE`        | `dvui_event_mouse_wheel(0, ±1)`                            |
+| `WHEELUP/DOWNMOUSE`        | `dvui_event_mouse_wheel(0, ±dvui.scroll_speed)` (default 80) |
 | Special keys (TAB, RET, BACK_SPACE, arrows, PAGE_UP/DOWN, HOME, END, INSERT, SPACE, modifiers, A–Z) | `dvui_event_key(code, pressed, mods)` |
 | `event.unicode` on PRESS   | `dvui_event_text(utf8 bytes)`                              |
 | `bpy.app.handlers.load_pre` | `dvui_event_app_quit` then `dvui_event_window_close`      |

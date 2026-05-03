@@ -3,9 +3,10 @@
     blender --python scripts/test_blender.py
 
 Loads the dvui addon, starts it, and after a short delay saves a
-screenshot of the 3D viewport so we can iterate without a human in the
-loop. Press Q to quit, or pass `--background` to run headless (note: GPU
-overlays usually do not render headless).
+screenshot of whichever editor area dvui took over (the sample
+configures NODE_EDITOR; the start operator converts the largest area
+to that type if needed). Pass `--auto-quit` to exit Blender after the
+shot, `--click` to drive a synthesized click sweep through the C ABI.
 """
 
 import os
@@ -38,12 +39,10 @@ def _redraw_all():
 
 def _start_dvui():
     print("[test] starting dvui...")
-    # Override context to a VIEW_3D area so the modal operator sees one.
+    # Pick the largest area; the start operator converts it to the
+    # addon's `space_type` if no matching area exists yet.
     win = bpy.context.window_manager.windows[0]
-    area = next((a for a in win.screen.areas if a.type == "VIEW_3D"), None)
-    if area is None:
-        print("[test] no VIEW_3D area found")
-        return None
+    area = max(win.screen.areas, key=lambda a: a.width * a.height)
     region = next((r for r in area.regions if r.type == "WINDOW"), None)
     try:
         with bpy.context.temp_override(window=win, area=area, region=region):
@@ -85,23 +84,26 @@ def _take_screenshot():
     target = out / "dvui_overlay.png"
     print(f"[test] saving screenshot -> {target}")
 
-    # Find a 3D area to override the operator context with.
+    # Find any area of the addon's space_type — that's where dvui
+    # rendered into.
+    space_type = (
+        dvui_addon._addon.space_type if dvui_addon._addon else "VIEW_3D"
+    )
     target_area = None
     target_region = None
     for win in bpy.context.window_manager.windows:
         for area in win.screen.areas:
-            if area.type == "VIEW_3D":
+            if area.type == space_type:
                 target_area = area
-                for region in area.regions:
-                    if region.type == "WINDOW":
-                        target_region = region
-                        break
+                target_region = next(
+                    (r for r in area.regions if r.type == "WINDOW"), None
+                )
                 break
         if target_area:
             break
 
     if target_area is None:
-        print("[test] no 3D viewport found")
+        print(f"[test] no area of type {space_type} found")
         return None
 
     try:

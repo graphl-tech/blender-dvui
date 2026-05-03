@@ -76,6 +76,15 @@ def _event_log(line: str) -> None:
         pass
 
 
+def _event_log_close() -> None:
+    global _event_log_file
+    if _event_log_file is not None:
+        try:
+            _event_log_file.close()
+        finally:
+            _event_log_file = None
+
+
 VERTEX_SOURCE = """
 void main() {
     v_uv = uv;
@@ -134,8 +143,8 @@ def _get_shader() -> gpu.types.GPUShader:
     return sh
 
 
-def _get_vbo_format(shader) -> gpu.types.GPUVertFormat:
-    """Manually built VertFormat that matches the shader's vertex_in
+def _get_vbo_format() -> gpu.types.GPUVertFormat:
+    """Cached VertFormat that matches the shader's vertex_in
     declarations. ``shader.format_calc()`` returns a format whose
     attribute names don't always match the source ('pos'/'uv'/'col'),
     so we construct one ourselves and use the same names we wrote in
@@ -150,7 +159,6 @@ def _get_vbo_format(shader) -> gpu.types.GPUVertFormat:
     fmt.attr_add(id="uv", comp_type="F32", len=2, fetch_mode="FLOAT")
     fmt.attr_add(id="col", comp_type="F32", len=4, fetch_mode="FLOAT")
     _vbo_format_cache[key] = fmt
-    _ = shader  # kept for future caching by shader id
     return fmt
 
 
@@ -405,7 +413,7 @@ class DvuiSession:
         # Build the shared vertex buffer once per frame. All draw
         # commands below reference this same VBO via their own (small)
         # IndexBuf — we avoid re-uploading the vertex stream N times.
-        fmt = _get_vbo_format(shader)
+        fmt = _get_vbo_format()
         vbo = gpu.types.GPUVertBuf(fmt, v_count)
         vbo.attr_fill("pos", positions)
         vbo.attr_fill("uv", uvs)
@@ -611,6 +619,7 @@ class Addon:
             except ValueError:
                 pass
             self._load_pre_handler = None
+        _event_log_close()
         for c in reversed(self.classes):
             try:
                 bpy.utils.unregister_class(c)
