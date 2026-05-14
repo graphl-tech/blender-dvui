@@ -20,6 +20,10 @@
         "build.zig.zon",
         "src",
         "backend",
+        "addon",
+        "main.py",
+        "pyproject.toml",
         "sample_app",
+        "scripts",
     },
 }
