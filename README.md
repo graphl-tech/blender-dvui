@@ -235,11 +235,13 @@ repo uses; see `build.zig.zon`) and `blender_dvui` (path or url):
 },
 ```
 
-`zig build` then writes a self-contained addon directory:
+`zig build` then writes a self-contained addon directory and a
+matching zip:
 
 ```
 zig-out/
   blender_addon/
+    my_awesome_ui-blender.zip   (ready for Install from Disk…)
     my_awesome_ui/
       __init__.py        (templated for app_name / slug / space_type)
       dvui_native.py     (verbatim copy)
@@ -247,8 +249,9 @@ zig-out/
       libmy_awesome_ui_dvui.so
 ```
 
-Drop that directory into Blender's `addons/` folder, then enable
-"My Awesome UI" in *Edit > Preferences > Add-ons*. The N-panel of the
+Either point Blender's *Edit > Preferences > Add-ons > Install from
+Disk...* at the zip, or drop the directory into Blender's `addons/`
+folder directly. Then enable "My Awesome UI". The N-panel of the
 configured editor will gain a tab labeled with `app_name` and a
 start/stop button. `bpy.ops.<slug>.start()` / `<slug>.stop()` are the
 operator names.

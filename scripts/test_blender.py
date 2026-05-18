@@ -15,14 +15,15 @@ from pathlib import Path
 
 import bpy
 
-REPO = Path(__file__).resolve().parent.parent
+# REPO = Path(__file__).resolve().parent.parent
+REPO = Path("/home/mike/projects/graphl-worktrees/available2/ide/zig-out/scripts/addons")
 sys.path.insert(0, str(REPO))
 os.environ.setdefault(
     "BLENDER_DVUI_LIB",
-    str(REPO / "zig-out" / "lib" / "libblender_dvui.so"),
+    str(REPO / "graphl_ide" / "libblender_dvui.so"),
 )
 
-import addon as dvui_addon  # noqa: E402
+import graphl_ide as dvui_addon  # noqa: E402
 
 dvui_addon.register()
 
@@ -46,9 +47,9 @@ def _start_dvui():
     region = next((r for r in area.regions if r.type == "WINDOW"), None)
     try:
         with bpy.context.temp_override(window=win, area=area, region=region):
-            bpy.ops.dvui_sample.start("INVOKE_DEFAULT")
+            bpy.ops.graphl_ide.start("INVOKE_DEFAULT")
     except Exception as e:
-        print(f"[test] dvui_sample.start failed: {e}")
+        print(f"[test] graphl_ide.start failed: {e}")
         return None
     _redraw_all()
     return None
