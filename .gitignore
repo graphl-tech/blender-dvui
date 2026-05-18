@@ -6,5 +6,9 @@ zig-pkg
 # test output
 scripts/out/*
 
+# worktrees
+worktrees
+.worktrees
+
 # python
 __pycache__
