@@ -121,6 +121,12 @@ pub const BlenderAddon = struct {
 
     /// Slug used for the operator namespace and cdylib filename.
     slug: []const u8,
+
+    /// Absolute path to the produced zip, e.g.
+    /// `"<install_prefix>/blender_addon/my_app-blender.zip"`. The zip
+    /// contains a single top-level `<slug>/` directory, which is the
+    /// layout Blender's "Install from Disk..." expects.
+    zip_path: []const u8,
 };
 
 /// Build a complete Blender addon for a DVUI app.
@@ -131,9 +137,14 @@ pub const BlenderAddon = struct {
 ///   - `overlay.py` (verbatim copy of the rendering / modal-operator code)
 ///   - `lib<slug>_dvui.{so,dylib,dll}` (the cdylib)
 ///
-/// To install the resulting addon in Blender, copy the produced
-/// directory into Blender's `addons/` folder, then enable
-/// "<App Name>" in Edit > Preferences > Add-ons.
+/// And also bundles that directory into
+/// `zig-out/<install_root>/<slug>-blender.zip` for use with Blender's
+/// *Install from Disk...* workflow.
+///
+/// To install the resulting addon in Blender, either point *Install
+/// from Disk...* at the zip, or copy the produced directory into
+/// Blender's `addons/` folder. Then enable "<App Name>" in
+/// Edit > Preferences > Add-ons.
 ///
 /// Returns a `BlenderAddon` whose `step` builds the addon when
 /// invoked. The function does NOT auto-attach to `b.getInstallStep()`
@@ -235,6 +246,19 @@ pub fn buildBlenderAddon(b: *std.Build, opts: BlenderAddonOptions) BlenderAddon 
         b.fmt("{s}/overlay.py", .{subdir}),
     );
 
+    // Zip the addon directory into `<install_root>/<slug>-blender.zip`,
+    // with `<slug>/...` as the zip's top-level entry — that's what
+    // Blender's "Install from Disk..." expects.
+    const install_root_abs = b.getInstallPath(.{ .custom = opts.install_root }, "");
+    const slug_dir_abs = b.getInstallPath(.{ .custom = subdir }, "");
+    const zip_path = b.fmt("{s}/{s}-blender.zip", .{ install_root_abs, slug });
+
+    const zip_step = ZipDirStep.create(b, slug_dir_abs, zip_path, slug);
+    zip_step.step.dependOn(&install_lib.step);
+    zip_step.step.dependOn(&install_init.step);
+    zip_step.step.dependOn(&install_native.step);
+    zip_step.step.dependOn(&install_overlay.step);
+
     const top = b.allocator.create(std.Build.Step) catch @panic("OOM");
     top.* = std.Build.Step.init(.{
         .id = .custom,
@@ -245,12 +269,14 @@ pub fn buildBlenderAddon(b: *std.Build, opts: BlenderAddonOptions) BlenderAddon 
     top.dependOn(&install_init.step);
     top.dependOn(&install_native.step);
     top.dependOn(&install_overlay.step);
+    top.dependOn(&zip_step.step);
 
     return .{
         .step = top,
         .lib = lib,
         .install_subdir = subdir,
         .slug = slug,
+        .zip_path = zip_path,
     };
 }
 
@@ -282,4 +308,192 @@ fn slugify(b: *std.Build, name: []const u8) []const u8 {
         return prefixed;
     }
     return buf[0..len];
+}
+
+/// Custom build step that bundles a directory into a zip archive.
+///
+/// Uses the "stored" (no compression) ZIP method, which keeps the
+/// implementation small while still producing a file that Blender's
+/// addon installer accepts. Output is deterministic: entries are
+/// sorted by name and timestamps are pinned to 1980-01-01.
+const ZipDirStep = struct {
+    step: std.Build.Step,
+    source_dir_abs: []const u8,
+    output_path_abs: []const u8,
+    top_name: []const u8,
+
+    fn create(
+        b: *std.Build,
+        source_dir_abs: []const u8,
+        output_path_abs: []const u8,
+        top_name: []const u8,
+    ) *ZipDirStep {
+        const self = b.allocator.create(ZipDirStep) catch @panic("OOM");
+        self.* = .{
+            .step = std.Build.Step.init(.{
+                .id = .custom,
+                .name = b.fmt("zip {s}", .{std.fs.path.basename(output_path_abs)}),
+                .owner = b,
+                .makeFn = make,
+            }),
+            .source_dir_abs = source_dir_abs,
+            .output_path_abs = output_path_abs,
+            .top_name = top_name,
+        };
+        return self;
+    }
+
+    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+        _ = options;
+        const self: *ZipDirStep = @fieldParentPtr("step", step);
+        try writeZipOfDir(
+            step.owner.allocator,
+            self.source_dir_abs,
+            self.output_path_abs,
+            self.top_name,
+        );
+    }
+};
+
+const ZipEntry = struct {
+    /// Path as it appears inside the zip, with `/` separators.
+    /// Directories have a trailing `/`.
+    name: []u8,
+    kind: enum { file, dir },
+    data: []u8,
+    crc: u32,
+    local_header_offset: u32 = 0,
+};
+
+fn writeZipOfDir(
+    alloc: std.mem.Allocator,
+    source_dir_abs: []const u8,
+    output_path_abs: []const u8,
+    top_name: []const u8,
+) !void {
+    var src = try std.fs.cwd().openDir(source_dir_abs, .{ .iterate = true });
+    defer src.close();
+
+    var entries: std.ArrayList(ZipEntry) = .empty;
+    defer {
+        for (entries.items) |e| {
+            alloc.free(e.name);
+            alloc.free(e.data);
+        }
+        entries.deinit(alloc);
+    }
+
+    try entries.append(alloc, .{
+        .name = try std.fmt.allocPrint(alloc, "{s}/", .{top_name}),
+        .kind = .dir,
+        .data = &.{},
+        .crc = 0,
+    });
+
+    var walker = try src.walk(alloc);
+    defer walker.deinit();
+    while (try walker.next()) |entry| {
+        switch (entry.kind) {
+            .directory => {
+                try entries.append(alloc, .{
+                    .name = try std.fmt.allocPrint(alloc, "{s}/{s}/", .{ top_name, entry.path }),
+                    .kind = .dir,
+                    .data = &.{},
+                    .crc = 0,
+                });
+            },
+            .file => {
+                const data = try src.readFileAlloc(alloc, entry.path, std.math.maxInt(usize));
+                try entries.append(alloc, .{
+                    .name = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ top_name, entry.path }),
+                    .kind = .file,
+                    .data = data,
+                    .crc = std.hash.Crc32.hash(data),
+                });
+            },
+            else => {},
+        }
+    }
+
+    std.mem.sort(ZipEntry, entries.items, {}, struct {
+        fn lt(_: void, a: ZipEntry, b: ZipEntry) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lt);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    // Local file headers + data.
+    for (entries.items) |*e| {
+        e.local_header_offset = @intCast(buf.items.len);
+        try writeU32Le(alloc, &buf, 0x04034b50); // local file header signature
+        try writeU16Le(alloc, &buf, 20); // version needed
+        try writeU16Le(alloc, &buf, 0); // flags
+        try writeU16Le(alloc, &buf, 0); // method = stored
+        try writeU16Le(alloc, &buf, 0); // dos time (00:00:00)
+        try writeU16Le(alloc, &buf, 0x0021); // dos date (1980-01-01)
+        try writeU32Le(alloc, &buf, e.crc);
+        try writeU32Le(alloc, &buf, @intCast(e.data.len)); // compressed
+        try writeU32Le(alloc, &buf, @intCast(e.data.len)); // uncompressed
+        try writeU16Le(alloc, &buf, @intCast(e.name.len));
+        try writeU16Le(alloc, &buf, 0); // extra field length
+        try buf.appendSlice(alloc, e.name);
+        try buf.appendSlice(alloc, e.data);
+    }
+
+    // Central directory.
+    const cd_offset: u32 = @intCast(buf.items.len);
+    for (entries.items) |e| {
+        try writeU32Le(alloc, &buf, 0x02014b50); // central directory signature
+        try writeU16Le(alloc, &buf, 0x031e); // version made by: unix, zip 3.0
+        try writeU16Le(alloc, &buf, 20); // version needed
+        try writeU16Le(alloc, &buf, 0); // flags
+        try writeU16Le(alloc, &buf, 0); // method
+        try writeU16Le(alloc, &buf, 0); // time
+        try writeU16Le(alloc, &buf, 0x0021); // date
+        try writeU32Le(alloc, &buf, e.crc);
+        try writeU32Le(alloc, &buf, @intCast(e.data.len));
+        try writeU32Le(alloc, &buf, @intCast(e.data.len));
+        try writeU16Le(alloc, &buf, @intCast(e.name.len));
+        try writeU16Le(alloc, &buf, 0); // extra field length
+        try writeU16Le(alloc, &buf, 0); // comment length
+        try writeU16Le(alloc, &buf, 0); // disk number
+        try writeU16Le(alloc, &buf, 0); // internal attrs
+        // External attrs: unix mode in upper 16 bits, DOS attrs in lower.
+        const ext_attrs: u32 = switch (e.kind) {
+            .dir => (@as(u32, 0o040755) << 16) | 0x10,
+            .file => (@as(u32, 0o100644) << 16),
+        };
+        try writeU32Le(alloc, &buf, ext_attrs);
+        try writeU32Le(alloc, &buf, e.local_header_offset);
+        try buf.appendSlice(alloc, e.name);
+    }
+    const cd_size: u32 = @as(u32, @intCast(buf.items.len)) - cd_offset;
+
+    // End of central directory record.
+    try writeU32Le(alloc, &buf, 0x06054b50);
+    try writeU16Le(alloc, &buf, 0); // this disk
+    try writeU16Le(alloc, &buf, 0); // disk where CD starts
+    try writeU16Le(alloc, &buf, @intCast(entries.items.len));
+    try writeU16Le(alloc, &buf, @intCast(entries.items.len));
+    try writeU32Le(alloc, &buf, cd_size);
+    try writeU32Le(alloc, &buf, cd_offset);
+    try writeU16Le(alloc, &buf, 0); // comment length
+
+    var out = try std.fs.cwd().createFile(output_path_abs, .{ .truncate = true });
+    defer out.close();
+    try out.writeAll(buf.items);
+}
+
+fn writeU16Le(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), v: u16) !void {
+    var tmp: [2]u8 = undefined;
+    std.mem.writeInt(u16, &tmp, v, .little);
+    try buf.appendSlice(alloc, &tmp);
+}
+
+fn writeU32Le(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), v: u32) !void {
+    var tmp: [4]u8 = undefined;
+    std.mem.writeInt(u32, &tmp, v, .little);
+    try buf.appendSlice(alloc, &tmp);
 }
