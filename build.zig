@@ -99,8 +99,27 @@ pub const BlenderAddonOptions = struct {
     /// Defaults to `"blender_addon"`.
     install_root: []const u8 = "blender_addon",
 
+    /// Optional caller-supplied files that ride along inside the
+    /// generated addon directory. Each entry is installed at
+    /// `<install_root>/<slug>/<name>`. If `name` matches one of the
+    /// files this helper would otherwise install — `"__init__.py"`,
+    /// `"dvui_native.py"`, `"overlay.py"`, or
+    /// `"lib<slug>_dvui.{so,dylib,dll}"` — the caller's file wins and
+    /// the default is omitted. Use this to swap the Python addon
+    /// implementation for one tailored to your app (e.g. a layer that
+    /// spawns a Node.js host).
+    extra_files: []const ExtraFile = &.{},
+
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+};
+
+pub const ExtraFile = struct {
+    /// Path *inside* `<install_root>/<slug>/`. Use forward slashes
+    /// even on Windows.
+    name: []const u8,
+    /// File contents.
+    source: std.Build.LazyPath,
 };
 
 pub const BlenderAddon = struct {
@@ -231,20 +250,27 @@ pub fn buildBlenderAddon(b: *std.Build, opts: BlenderAddonOptions) BlenderAddon 
         .slug = slug,
     });
 
+    // Which of the default files did the caller override? We skip
+    // installing the default for any name present in extra_files.
+    var overrode_init = false;
+    var overrode_native = false;
+    var overrode_overlay = false;
+    for (opts.extra_files) |ef| {
+        if (std.mem.eql(u8, ef.name, "__init__.py")) overrode_init = true;
+        if (std.mem.eql(u8, ef.name, "dvui_native.py")) overrode_native = true;
+        if (std.mem.eql(u8, ef.name, "overlay.py")) overrode_overlay = true;
+    }
+
     const wf = b.addWriteFiles();
     const init_path = wf.add("__init__.py", init_py);
-    const install_init = b.addInstallFile(
-        init_path,
-        b.fmt("{s}/__init__.py", .{subdir}),
-    );
-    const install_native = b.addInstallFile(
-        dep.path("addon/dvui_native.py"),
-        b.fmt("{s}/dvui_native.py", .{subdir}),
-    );
-    const install_overlay = b.addInstallFile(
-        dep.path("addon/overlay.py"),
-        b.fmt("{s}/overlay.py", .{subdir}),
-    );
+
+    const top = b.allocator.create(std.Build.Step) catch @panic("OOM");
+    top.* = std.Build.Step.init(.{
+        .id = .custom,
+        .name = b.fmt("blender-addon ({s})", .{slug}),
+        .owner = b,
+    });
+    top.dependOn(&install_lib.step);
 
     // Zip the addon directory into `<install_root>/<slug>-blender.zip`,
     // with `<slug>/...` as the zip's top-level entry — that's what
@@ -255,20 +281,41 @@ pub fn buildBlenderAddon(b: *std.Build, opts: BlenderAddonOptions) BlenderAddon 
 
     const zip_step = ZipDirStep.create(b, slug_dir_abs, zip_path, slug);
     zip_step.step.dependOn(&install_lib.step);
-    zip_step.step.dependOn(&install_init.step);
-    zip_step.step.dependOn(&install_native.step);
-    zip_step.step.dependOn(&install_overlay.step);
 
-    const top = b.allocator.create(std.Build.Step) catch @panic("OOM");
-    top.* = std.Build.Step.init(.{
-        .id = .custom,
-        .name = b.fmt("blender-addon ({s})", .{slug}),
-        .owner = b,
-    });
-    top.dependOn(&install_lib.step);
-    top.dependOn(&install_init.step);
-    top.dependOn(&install_native.step);
-    top.dependOn(&install_overlay.step);
+    if (!overrode_init) {
+        const install_init = b.addInstallFile(
+            init_path,
+            b.fmt("{s}/__init__.py", .{subdir}),
+        );
+        zip_step.step.dependOn(&install_init.step);
+        top.dependOn(&install_init.step);
+    }
+    if (!overrode_native) {
+        const install_native = b.addInstallFile(
+            dep.path("addon/dvui_native.py"),
+            b.fmt("{s}/dvui_native.py", .{subdir}),
+        );
+        zip_step.step.dependOn(&install_native.step);
+        top.dependOn(&install_native.step);
+    }
+    if (!overrode_overlay) {
+        const install_overlay = b.addInstallFile(
+            dep.path("addon/overlay.py"),
+            b.fmt("{s}/overlay.py", .{subdir}),
+        );
+        zip_step.step.dependOn(&install_overlay.step);
+        top.dependOn(&install_overlay.step);
+    }
+
+    for (opts.extra_files) |ef| {
+        const install_extra = b.addInstallFile(
+            ef.source,
+            b.fmt("{s}/{s}", .{ subdir, ef.name }),
+        );
+        zip_step.step.dependOn(&install_extra.step);
+        top.dependOn(&install_extra.step);
+    }
+
     top.dependOn(&zip_step.step);
 
     return .{
