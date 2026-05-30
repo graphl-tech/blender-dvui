@@ -55,6 +55,15 @@ _VTX_DTYPE = np.dtype([
 _EVENT_LOG_PATH = os.environ.get("BLENDER_DVUI_EVENT_LOG")
 _event_log_file = None
 
+# Optional one-line-per-cursor-change log. Tail this while moving the
+# pointer to diagnose flicker: each line shows what dvui requested vs.
+# what _sync_cursor decided to push (or restore). If dvui isn't
+# oscillating its request but the visible cursor still flickers, the
+# blame is on Blender's own per-event cursor reset (the reason we use
+# cursor_modal_set rather than cursor_set).
+_CURSOR_LOG_PATH = os.environ.get("BLENDER_DVUI_CURSOR_LOG")
+_cursor_log_file = None
+
 # DVUI expresses scroll wheel input in pixels. Other backends (SDL,
 # GLFW, …) multiply each OS wheel notch by `dvui.scroll_speed` (default
 # 80). Match that here so wheel zoom feels normal instead of glacial.
@@ -83,6 +92,30 @@ def _event_log_close() -> None:
             _event_log_file.close()
         finally:
             _event_log_file = None
+
+
+def _cursor_log(line: str) -> None:
+    global _cursor_log_file
+    if _CURSOR_LOG_PATH is None:
+        return
+    if _cursor_log_file is None:
+        try:
+            _cursor_log_file = open(_CURSOR_LOG_PATH, "w", buffering=1)
+        except Exception:
+            return
+    try:
+        _cursor_log_file.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _cursor_log_close() -> None:
+    global _cursor_log_file
+    if _cursor_log_file is not None:
+        try:
+            _cursor_log_file.close()
+        finally:
+            _cursor_log_file = None
 
 
 VERTEX_SOURCE = """
@@ -225,6 +258,14 @@ class DvuiSession:
     # belong to dvui.
     _buttons_held: set = field(default_factory=set)
 
+    # Last cursor we pushed via `Window.cursor_modal_set`, or None if
+    # we currently hand cursor control back to Blender. We keep the
+    # window reference too so we can call `cursor_modal_restore` on
+    # the same window even if `_sync_cursor` later runs in a context
+    # that points at a different one.
+    _modal_cursor_name: Optional[str] = None
+    _modal_cursor_window: object = None
+
     # --- lifecycle ---
 
     def start(self) -> None:
@@ -243,6 +284,9 @@ class DvuiSession:
     def stop(self) -> None:
         if not self.running:
             return
+        # Hand the cursor back BEFORE tearing the rest down — we don't
+        # want a modal cursor to outlive the session.
+        self._restore_modal_cursor()
         if self.draw_handler is not None and self.space_class is not None:
             self.space_class.draw_handler_remove(self.draw_handler, "WINDOW")
             self.draw_handler = None
@@ -337,29 +381,101 @@ class DvuiSession:
         self._render()
         self._sync_cursor(ctx)
 
+    # --- cursor sync (modal-cursor based) ----------------------------------
+    #
+    # The naive approach is `Window.cursor_set(...)` inside the draw
+    # handler. Two problems with that:
+    #
+    #   1. `cursor_set` only persists until the next event. As soon as
+    #      Blender processes a MOUSEMOVE, it re-picks the cursor from
+    #      its own logic (area-resize arrow at boundaries, default
+    #      arrow elsewhere). Our per-redraw override then snaps it
+    #      back. The interleaving produces visible flicker — most
+    #      apparent on hover (toggling between DEFAULT and HAND) and
+    #      near area edges (toggling between MOVE_X and DEFAULT).
+    #
+    #   2. Calling `cursor_set("DEFAULT")` every frame stomps any
+    #      transient cursor Blender would otherwise show — like the
+    #      resize arrow at an area split handle — turning the cursor
+    #      into a flickering tug of war.
+    #
+    # `Window.cursor_modal_set(name)` is the right primitive: it
+    # persists for the lifetime of a modal operator (which we are),
+    # and a paired `cursor_modal_restore()` hands control back to
+    # Blender so its own per-region cursor logic resumes.
+
+    # Pixels of slack inside the WINDOW region where we DON'T override
+    # the cursor — Blender draws the area-split / corner handles in
+    # this band and the user expects the resize arrows there.
+    _EDGE_MARGIN_PX: int = 4
+
+    def _restore_modal_cursor(self) -> None:
+        if self._modal_cursor_name is None:
+            return
+        win = self._modal_cursor_window
+        if win is not None:
+            try:
+                win.cursor_modal_restore()
+            except Exception:
+                pass
+        _cursor_log(f"restore (was {self._modal_cursor_name})")
+        self._modal_cursor_name = None
+        self._modal_cursor_window = None
+
+    def _push_modal_cursor(self, win, name: str) -> None:
+        if name == self._modal_cursor_name and win is self._modal_cursor_window:
+            return  # already set; cursor_modal_set is sticky
+        # Different window than last time? Restore the previous one
+        # first so we don't leak a modal cursor onto another window.
+        prev_win = self._modal_cursor_window
+        if prev_win is not None and prev_win is not win:
+            try:
+                prev_win.cursor_modal_restore()
+            except Exception:
+                pass
+        try:
+            win.cursor_modal_set(name)
+        except Exception:
+            return
+        _cursor_log(f"set {name} (was {self._modal_cursor_name})")
+        self._modal_cursor_name = name
+        self._modal_cursor_window = win
+
     def _sync_cursor(self, ctx) -> None:
-        """Forward dvui's cursor request to the Blender window. Only
-        active while the cursor is inside the editor's WINDOW region —
-        otherwise we'd fight with Blender's own cursors over the
-        header / sidebar / other areas.
-        """
         win = ctx.window
         region = ctx.region
         if win is None or region is None:
             return
-        # We don't have event.mouse_x here; use the last cursor
-        # position dvui saw via forward_event.
+
+        # We don't get the live event.mouse_x in the draw handler; use
+        # the last position dvui saw via forward_event.
         last_x, last_y = self.last_pixel
-        in_region = 0 <= last_x < region.width and 0 <= last_y < region.height
+
+        edge = self._EDGE_MARGIN_PX
+        in_region = (
+            edge <= last_x < region.width - edge
+            and edge <= last_y < region.height - edge
+        )
         if not in_region:
+            # Cursor is near (or past) the area edge — let Blender
+            # draw its resize / split-handle cursors there.
+            self._restore_modal_cursor()
             return
+
         idx = self.native.lib.dvui_cursor_requested(self.ctx)
         cursors = dvui_native.DVUI_CURSOR_TO_BLENDER
-        if 0 <= idx < len(cursors):
-            try:
-                win.cursor_set(cursors[idx])
-            except Exception:
-                pass
+        desired = cursors[idx] if 0 <= idx < len(cursors) else "DEFAULT"
+
+        if desired == "DEFAULT":
+            # Don't override Blender's default cursor management; it's
+            # what we'd be setting it to anyway, and skipping the call
+            # lets transient Blender cursors (area-resize arrows
+            # creeping into the inner margin, dropper picks from other
+            # tools, etc.) render unperturbed.
+            self._restore_modal_cursor()
+            return
+
+        self._push_modal_cursor(win, desired)
 
     def _render(self) -> None:
         n_v = C.c_uint32()
@@ -620,6 +736,7 @@ class Addon:
                 pass
             self._load_pre_handler = None
         _event_log_close()
+        _cursor_log_close()
         for c in reversed(self.classes):
             try:
                 bpy.utils.unregister_class(c)
