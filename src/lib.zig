@@ -113,6 +113,22 @@ export fn dvui_resize(ctx: *Ctx, width: u32, height: u32) void {
     ctx.backend.setSize(width, height);
 }
 
+/// Route clipboard reads/writes through the host (e.g. Blender's
+/// `window_manager.clipboard`, which is the system clipboard). `get`
+/// returns a null-terminated UTF-8 string that must remain valid until
+/// the next callback; it is copied immediately. Pass nulls to fall back
+/// to the app-local clipboard buffer.
+export fn dvui_set_clipboard_callbacks(
+    ctx: *Ctx,
+    get: ?blender_backend.ClipboardGetFn,
+    set: ?blender_backend.ClipboardSetFn,
+    userdata: ?*anyopaque,
+) void {
+    ctx.backend.clipboard_get = get;
+    ctx.backend.clipboard_set = set;
+    ctx.backend.clipboard_userdata = userdata;
+}
+
 export fn dvui_event_mouse_motion(ctx: *Ctx, x: f32, y: f32) void {
     _ = ctx.window.addEventMouseMotion(.{ .pt = .{ .x = x, .y = y } }) catch {};
 }

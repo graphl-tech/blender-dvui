@@ -53,6 +53,14 @@ pub const TextureInfo = extern struct {
     pixels: [*]const u8,
 };
 
+/// Host-provided system clipboard hooks (set via the C ABI). The get
+/// callback returns a null-terminated string that must stay valid until
+/// the next callback invocation; we copy it into the frame arena
+/// immediately. When unset, the `clipboard` field acts as an app-local
+/// fallback.
+pub const ClipboardGetFn = *const fn (userdata: ?*anyopaque) callconv(.c) ?[*:0]const u8;
+pub const ClipboardSetFn = *const fn (userdata: ?*anyopaque, text: [*]const u8, len: u32) callconv(.c) void;
+
 const TextureEntry = struct {
     id: u32,
     width: u32,
@@ -77,6 +85,10 @@ textures: std.AutoArrayHashMapUnmanaged(u32, TextureEntry) = .{},
 next_texture_id: u32 = 1,
 pending_creates: std.ArrayListUnmanaged(u32) = .{},
 pending_destroys: std.ArrayListUnmanaged(u32) = .{},
+
+clipboard_get: ?ClipboardGetFn = null,
+clipboard_set: ?ClipboardSetFn = null,
+clipboard_userdata: ?*anyopaque = null,
 
 clipboard: std.ArrayListUnmanaged(u8) = .{},
 
@@ -291,10 +303,18 @@ pub fn textureFromTargetTemp(_: *Self, _: dvui.TextureTarget) !dvui.Texture {
 pub fn renderTarget(_: *Self, _: ?dvui.TextureTarget) !void {}
 
 pub fn clipboardText(self: *Self) ![]const u8 {
+    if (self.clipboard_get) |get| {
+        const ptr = get(self.clipboard_userdata) orelse return "";
+        return try self.arena.dupe(u8, std.mem.span(ptr));
+    }
     return try self.arena.dupe(u8, self.clipboard.items);
 }
 
 pub fn clipboardTextSet(self: *Self, text: []const u8) !void {
+    if (self.clipboard_set) |set| {
+        set(self.clipboard_userdata, text.ptr, @intCast(text.len));
+        return;
+    }
     self.clipboard.clearRetainingCapacity();
     try self.clipboard.appendSlice(self.gpa, text);
 }

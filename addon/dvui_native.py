@@ -53,6 +53,15 @@ class TextureInfo(C.Structure):
     ]
 
 
+# Clipboard bridge callbacks (must match Clipboard*Fn in
+# backend/src/backend.zig). The get callback returns a null-terminated
+# UTF-8 string; the returned buffer must stay alive until the next
+# callback invocation (Zig copies it immediately, but only after the
+# callback has returned — so don't return a temporary).
+CLIPBOARD_GET_FN = C.CFUNCTYPE(C.c_char_p, C.c_void_p)
+CLIPBOARD_SET_FN = C.CFUNCTYPE(None, C.c_void_p, C.POINTER(C.c_uint8), C.c_uint32)
+
+
 # Stable integer key codes (must match KeyCode in src/lib.zig).
 KEY_NONE = 0
 KEY_BACKSPACE = 1
@@ -191,6 +200,11 @@ def _bind(lib: C.CDLL) -> None:
     s("dvui_create", [C.c_uint32, C.c_uint32], C.c_void_p)
     s("dvui_destroy", [C.c_void_p], None)
     s("dvui_resize", [C.c_void_p, C.c_uint32, C.c_uint32], None)
+    s(
+        "dvui_set_clipboard_callbacks",
+        [C.c_void_p, CLIPBOARD_GET_FN, CLIPBOARD_SET_FN, C.c_void_p],
+        None,
+    )
 
     s("dvui_event_mouse_motion", [C.c_void_p, C.c_float, C.c_float], None)
     s("dvui_event_mouse_button", [C.c_void_p, C.c_int, C.c_int], C.c_int)

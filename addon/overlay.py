@@ -258,6 +258,16 @@ class DvuiSession:
     # belong to dvui.
     _buttons_held: set = field(default_factory=set)
 
+    # ctypes callback objects bridging dvui's clipboard to the system
+    # clipboard via `bpy.context.window_manager.clipboard`. Held on the
+    # session so the C side never calls into a garbage-collected
+    # trampoline. `_clipboard_buf` keeps the bytes returned by the get
+    # callback alive until Zig has copied them (it copies right after
+    # the callback returns, but the pointer must survive the return).
+    _clipboard_get_cb: object = None
+    _clipboard_set_cb: object = None
+    _clipboard_buf: bytes = b""
+
     # Last cursor we pushed via `Window.cursor_modal_set`, or None if
     # we currently hand cursor control back to Blender. We keep the
     # window reference too so we can call `cursor_modal_restore` on
@@ -275,6 +285,7 @@ class DvuiSession:
         self.ctx = self.native.lib.dvui_create(800, 600)
         if not self.ctx:
             raise RuntimeError("dvui_create failed")
+        self._install_clipboard_bridge()
         self.draw_handler = self.space_class.draw_handler_add(
             self._draw, (), "WINDOW", "POST_PIXEL"
         )
@@ -296,9 +307,48 @@ class DvuiSession:
             self.native.lib.dvui_event_window_close(self.ctx)
             self.native.lib.dvui_destroy(self.ctx)
             self.ctx = None
+        # Safe to drop the callback trampolines only once the ctx that
+        # held their pointers is gone.
+        self._clipboard_get_cb = None
+        self._clipboard_set_cb = None
         self.textures.clear()
         self.running = False
         self.stop_requested = True
+
+    # --- clipboard bridge ---
+
+    def _install_clipboard_bridge(self) -> None:
+        """Route dvui copy/paste through the system clipboard.
+
+        Blender's ``window_manager.clipboard`` reads/writes the OS
+        clipboard, so dvui text widgets interoperate with other
+        applications instead of using the backend's app-local buffer.
+        Both callbacks fire inside ``dvui_frame`` / event forwarding,
+        i.e. on Blender's main thread with a valid ``bpy.context``.
+        """
+
+        def _get(_userdata):
+            try:
+                text = bpy.context.window_manager.clipboard
+            except Exception:
+                text = ""
+            self._clipboard_buf = text.encode("utf-8") + b"\x00"
+            return self._clipboard_buf
+
+        def _set(_userdata, ptr, length):
+            try:
+                data = C.string_at(ptr, length)
+                bpy.context.window_manager.clipboard = data.decode(
+                    "utf-8", "replace"
+                )
+            except Exception:
+                pass
+
+        self._clipboard_get_cb = dvui_native.CLIPBOARD_GET_FN(_get)
+        self._clipboard_set_cb = dvui_native.CLIPBOARD_SET_FN(_set)
+        self.native.lib.dvui_set_clipboard_callbacks(
+            self.ctx, self._clipboard_get_cb, self._clipboard_set_cb, None
+        )
 
     # --- explicit DVUI event helpers ---
 
