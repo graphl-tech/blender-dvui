@@ -473,12 +473,18 @@ class DvuiSession:
         self._modal_cursor_window = None
 
     def _push_modal_cursor(self, win, name: str) -> None:
-        if name == self._modal_cursor_name and win is self._modal_cursor_window:
+        # Compare windows by underlying pointer, never `is`: bpy hands
+        # out a fresh Python wrapper on every `bpy.context.window`
+        # access, so identity always fails and we'd restore+set the
+        # modal cursor on every redraw — a visible flicker between the
+        # requested cursor and the default one.
+        prev_win = self._modal_cursor_window
+        same_win = prev_win is not None and prev_win.as_pointer() == win.as_pointer()
+        if name == self._modal_cursor_name and same_win:
             return  # already set; cursor_modal_set is sticky
         # Different window than last time? Restore the previous one
         # first so we don't leak a modal cursor onto another window.
-        prev_win = self._modal_cursor_window
-        if prev_win is not None and prev_win is not win:
+        if prev_win is not None and not same_win:
             try:
                 prev_win.cursor_modal_restore()
             except Exception:
