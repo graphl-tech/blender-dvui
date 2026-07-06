@@ -105,7 +105,7 @@ pub fn init(opts: InitOptions) Self {
         .gpa = opts.gpa,
         .size = opts.size,
         .size_pixels = opts.size_pixels,
-        .start_time_ns = std.time.nanoTimestamp(),
+        .start_time_ns = @as(i128, std.Io.Clock.boot.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds),
     };
 }
 
@@ -137,11 +137,11 @@ pub fn setSize(self: *Self, w: u32, h: u32) void {
 
 pub fn nanoTime(self: *Self) i128 {
     _ = self;
-    return std.time.nanoTimestamp();
+    return @as(i128, std.Io.Clock.boot.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds);
 }
 
 pub fn sleep(_: *Self, ns: u64) void {
-    std.Thread.sleep(ns);
+    std.Io.Clock.Duration.sleep(.{ .clock = .boot, .raw = .fromNanoseconds(@intCast(ns)) }, std.Io.Threaded.global_single_threaded.io()) catch {};
 }
 
 pub fn begin(self: *Self, arena: std.mem.Allocator) !void {

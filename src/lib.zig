@@ -21,7 +21,7 @@ pub const std_options: std.Options = .{
 };
 
 const Ctx = struct {
-    gpa_state: std.heap.GeneralPurposeAllocator(.{}),
+    gpa_state: std.heap.DebugAllocator(.{}),
     backend: blender_backend,
     window: dvui.Window,
 };
@@ -350,7 +350,7 @@ export fn dvui_event_touch_motion(
 }
 
 export fn dvui_frame(ctx: *Ctx) c_int {
-    ctx.window.begin(std.time.nanoTimestamp()) catch return -1;
+    ctx.window.begin(@as(i128, std.Io.Clock.boot.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds)) catch return -1;
     app.frame() catch return -2;
     _ = ctx.window.end(.{}) catch return -3;
     return 0;
