@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) void {
     // Re-export the backend module under our own builder so external
     // users can do `b.dependency("blender_dvui").module("blender_backend")`
     // without also depending directly on the sub-package.
-    b.modules.put(b.dupe("blender_backend"), backend_mod) catch @panic("OOM");
+    b.modules.put(b.allocator, b.dupe("blender_backend"), backend_mod) catch @panic("OOM");
 
     linkBackend(dvui_mod, backend_mod);
 
@@ -394,6 +394,7 @@ const ZipDirStep = struct {
         _ = options;
         const self: *ZipDirStep = @fieldParentPtr("step", step);
         try writeZipOfDir(
+            step.owner.graph.io,
             step.owner.allocator,
             self.source_dir_abs,
             self.output_path_abs,
@@ -413,13 +414,14 @@ const ZipEntry = struct {
 };
 
 fn writeZipOfDir(
+    io: std.Io,
     alloc: std.mem.Allocator,
     source_dir_abs: []const u8,
     output_path_abs: []const u8,
     top_name: []const u8,
 ) !void {
-    var src = try std.fs.cwd().openDir(source_dir_abs, .{ .iterate = true });
-    defer src.close();
+    var src = try std.Io.Dir.cwd().openDir(io, source_dir_abs, .{ .iterate = true });
+    defer src.close(io);
 
     var entries: std.ArrayList(ZipEntry) = .empty;
     defer {
@@ -439,7 +441,7 @@ fn writeZipOfDir(
 
     var walker = try src.walk(alloc);
     defer walker.deinit();
-    while (try walker.next()) |entry| {
+    while (try walker.next(io)) |entry| {
         switch (entry.kind) {
             .directory => {
                 try entries.append(alloc, .{
@@ -450,7 +452,7 @@ fn writeZipOfDir(
                 });
             },
             .file => {
-                const data = try src.readFileAlloc(alloc, entry.path, std.math.maxInt(usize));
+                const data = try src.readFileAlloc(io, entry.path, alloc, .unlimited);
                 try entries.append(alloc, .{
                     .name = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ top_name, entry.path }),
                     .kind = .file,
@@ -528,9 +530,9 @@ fn writeZipOfDir(
     try writeU32Le(alloc, &buf, cd_offset);
     try writeU16Le(alloc, &buf, 0); // comment length
 
-    var out = try std.fs.cwd().createFile(output_path_abs, .{ .truncate = true });
-    defer out.close();
-    try out.writeAll(buf.items);
+    var out = try std.Io.Dir.cwd().createFile(io, output_path_abs, .{ .truncate = true });
+    defer out.close(io);
+    try out.writeStreamingAll(io, buf.items);
 }
 
 fn writeU16Le(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), v: u16) !void {

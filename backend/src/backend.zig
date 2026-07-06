@@ -77,20 +77,20 @@ size: dvui.Size.Natural,
 size_pixels: dvui.Size.Physical,
 content_scale: f32 = 1.0,
 
-vertices: std.ArrayListUnmanaged(Vertex) = .{},
-indices: std.ArrayListUnmanaged(u32) = .{},
-commands: std.ArrayListUnmanaged(DrawCmd) = .{},
+vertices: std.ArrayListUnmanaged(Vertex) = .empty,
+indices: std.ArrayListUnmanaged(u32) = .empty,
+commands: std.ArrayListUnmanaged(DrawCmd) = .empty,
 
 textures: std.AutoArrayHashMapUnmanaged(u32, TextureEntry) = .{},
 next_texture_id: u32 = 1,
-pending_creates: std.ArrayListUnmanaged(u32) = .{},
-pending_destroys: std.ArrayListUnmanaged(u32) = .{},
+pending_creates: std.ArrayListUnmanaged(u32) = .empty,
+pending_destroys: std.ArrayListUnmanaged(u32) = .empty,
 
 clipboard_get: ?ClipboardGetFn = null,
 clipboard_set: ?ClipboardSetFn = null,
 clipboard_userdata: ?*anyopaque = null,
 
-clipboard: std.ArrayListUnmanaged(u8) = .{},
+clipboard: std.ArrayListUnmanaged(u8) = .empty,
 
 start_time_ns: i128 = 0,
 
