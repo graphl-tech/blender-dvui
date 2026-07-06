@@ -5,7 +5,8 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .dvui = .{
-            .path = "../dvui",
+            .url = "git+https://github.com/MichaelBelousov/dvui#3c86c28fd489f5e171071adf16060fe815644c8d",
+            .hash = "dvui-0.5.0-dev-AQFJmUkM3wB1gZyiNSWX9GCt2Xx6N_X_VuchWAnczaVh",
         },
         .blender_dvui_backend = .{
             .path = "backend",
