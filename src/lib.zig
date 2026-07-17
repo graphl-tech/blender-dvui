@@ -157,12 +157,12 @@ export fn dvui_event_mouse_button(ctx: *Ctx, button: c_int, pressed: c_int) c_in
 export fn dvui_event_mouse_wheel(ctx: *Ctx, dx: f32, dy: f32) c_int {
     var handled: bool = false;
     if (dy != 0) {
-        if (ctx.window.addEventMouseWheel(dy, .vertical)) |h| {
+        if (ctx.window.addEventMouseWheel(dy, .vertical, null)) |h| {
             handled = handled or h;
         } else |_| {}
     }
     if (dx != 0) {
-        if (ctx.window.addEventMouseWheel(dx, .horizontal)) |h| {
+        if (ctx.window.addEventMouseWheel(dx, .horizontal, null)) |h| {
             handled = handled or h;
         } else |_| {}
     }

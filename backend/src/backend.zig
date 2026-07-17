@@ -221,14 +221,29 @@ pub fn drawClippedTriangles(
     try self.commands.append(self.gpa, cmd);
 }
 
+pub fn setCursor(self: *Self, cursor: dvui.enums.Cursor) void {
+    _ = self;
+    _ = cursor;
+}
+
+pub fn textInputRect(self: *Self, rect: ?dvui.Rect.Natural) void {
+    _ = self;
+    _ = rect;
+}
+
+pub fn renderPresent(self: *Self) void {
+    _ = self;
+}
+
 pub fn textureCreate(
     self: *Self,
     pixels: [*]const u8,
-    width: u32,
-    height: u32,
-    interpolation: dvui.enums.TextureInterpolation,
-    format: dvui.enums.TexturePixelFormat,
+    opts: dvui.Texture.CreateOptions,
 ) !dvui.Texture {
+    const width = opts.width;
+    const height = opts.height;
+    const interpolation = opts.interpolation;
+    const format = opts.format;
     const size: usize = @as(usize, width) * @as(usize, height) * 4;
     const buf = try self.gpa.alloc(u8, size);
     @memcpy(buf, pixels[0..size]);
@@ -250,6 +265,9 @@ pub fn textureCreate(
         .width = width,
         .height = height,
         .format = format,
+        .interpolation = interpolation,
+        .wrap_u = opts.wrap_u,
+        .wrap_v = opts.wrap_v,
     };
 }
 
