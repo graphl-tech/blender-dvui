@@ -55,6 +55,18 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
+    const self_dep = b.allocator.create(std.Build.Dependency) catch @panic("OOM");
+    self_dep.* = .{ .builder = b };
+    const sample_addon = buildBlenderAddon(b, .{
+        .blender_dvui_dep = self_dep,
+        .dvui_module = dvui_mod,
+        .app_module = app_mod,
+        .app_name = "DVUI Sample",
+        .target = target,
+        .optimize = optimize,
+    });
+    b.step("blender-addon", "Build the sample app as a Blender addon").dependOn(sample_addon.step);
+
     const test_step = b.step("test", "Run tests");
     const lib_tests = b.addTest(.{ .root_module = lib_mod });
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
@@ -141,11 +153,11 @@ pub const BlenderAddon = struct {
     /// Slug used for the operator namespace and cdylib filename.
     slug: []const u8,
 
-    /// Absolute path to the produced zip, e.g.
-    /// `"<install_prefix>/blender_addon/my_app-blender.zip"`. The zip
-    /// contains a single top-level `<slug>/` directory, which is the
-    /// layout Blender's "Install from Disk..." expects.
-    zip_path: []const u8,
+    /// The produced zip, also installed as
+    /// `<install_root>/<slug>-blender.zip`. The zip contains a single
+    /// top-level `<slug>/` directory, which is the layout Blender's
+    /// "Install from Disk..." expects.
+    zip: std.Build.LazyPath,
 };
 
 /// Build a complete Blender addon for a DVUI app.
@@ -171,10 +183,11 @@ pub const BlenderAddon = struct {
 /// dedicated step.
 pub fn buildBlenderAddon(b: *std.Build, opts: BlenderAddonOptions) BlenderAddon {
     const dep = opts.blender_dvui_dep;
+    const pkg = dep.builder;
     const backend_mod = dep.module("blender_backend");
 
     // Idempotent if the caller already wired things; addImport just
-    // overwrites in zig 0.15.
+    // overwrites.
     linkBackend(opts.dvui_module, backend_mod);
     opts.app_module.addImport("dvui", opts.dvui_module);
 
@@ -183,7 +196,7 @@ pub fn buildBlenderAddon(b: *std.Build, opts: BlenderAddonOptions) BlenderAddon 
     const subdir = b.fmt("{s}/{s}", .{ opts.install_root, slug });
 
     const lib_mod = b.createModule(.{
-        .root_source_file = dep.path("src/lib.zig"),
+        .root_source_file = pkg.path("src/lib.zig"),
         .target = opts.target,
         .optimize = opts.optimize,
         .link_libc = true,
@@ -198,10 +211,6 @@ pub fn buildBlenderAddon(b: *std.Build, opts: BlenderAddonOptions) BlenderAddon 
         .name = lib_name,
         .linkage = .dynamic,
         .root_module = lib_mod,
-    });
-
-    const install_lib = b.addInstallArtifact(lib, .{
-        .dest_dir = .{ .override = .{ .custom = subdir } },
     });
 
     // Generate the per-app __init__.py.
@@ -250,81 +259,56 @@ pub fn buildBlenderAddon(b: *std.Build, opts: BlenderAddonOptions) BlenderAddon 
         .slug = slug,
     });
 
-    // Which of the default files did the caller override? We skip
-    // installing the default for any name present in extra_files.
-    var overrode_init = false;
-    var overrode_native = false;
-    var overrode_overlay = false;
-    for (opts.extra_files) |ef| {
-        if (std.mem.eql(u8, ef.name, "__init__.py")) overrode_init = true;
-        if (std.mem.eql(u8, ef.name, "dvui_native.py")) overrode_native = true;
-        if (std.mem.eql(u8, ef.name, "overlay.py")) overrode_overlay = true;
+    const addon_dir = b.addWriteFiles();
+    const defaults = [_]ExtraFile{
+        .{ .name = "dvui_native.py", .source = pkg.path("addon/dvui_native.py") },
+        .{ .name = "overlay.py", .source = pkg.path("addon/overlay.py") },
+        .{ .name = lib.out_filename, .source = lib.getEmittedBin() },
+    };
+    if (!isOverridden(opts.extra_files, "__init__.py")) _ = addon_dir.add("__init__.py", init_py);
+    for (defaults) |def| {
+        if (!isOverridden(opts.extra_files, def.name)) _ = addon_dir.addCopyFile(def.source, def.name);
     }
+    for (opts.extra_files) |ef| _ = addon_dir.addCopyFile(ef.source, ef.name);
 
-    const wf = b.addWriteFiles();
-    const init_path = wf.add("__init__.py", init_py);
-
-    const top = b.allocator.create(std.Build.Step) catch @panic("OOM");
-    top.* = std.Build.Step.init(.{
-        .id = .custom,
-        .name = b.fmt("blender-addon ({s})", .{slug}),
-        .owner = b,
+    const install_dir = b.addInstallDirectory(.{
+        .source_dir = addon_dir.getDirectory(),
+        .install_dir = .prefix,
+        .install_subdir = subdir,
     });
-    top.dependOn(&install_lib.step);
 
-    // Zip the addon directory into `<install_root>/<slug>-blender.zip`,
-    // with `<slug>/...` as the zip's top-level entry — that's what
+    // `<slug>/...` is the zip's top-level entry, which is what
     // Blender's "Install from Disk..." expects.
-    const install_root_abs = b.getInstallPath(.{ .custom = opts.install_root }, "");
-    const slug_dir_abs = b.getInstallPath(.{ .custom = subdir }, "");
-    const zip_path = b.fmt("{s}/{s}-blender.zip", .{ install_root_abs, slug });
+    const zip_dir = pkg.addExecutable(.{
+        .name = "zip_dir",
+        .root_module = pkg.createModule(.{
+            .root_source_file = pkg.path("tools/zip_dir.zig"),
+            .target = pkg.graph.host,
+        }),
+    });
+    const zip_run = b.addRunArtifact(zip_dir);
+    zip_run.addDirectoryArg(addon_dir.getDirectory());
+    zip_run.addArg(slug);
+    const zip_name = b.fmt("{s}-blender.zip", .{slug});
+    const zip = zip_run.addOutputFileArg(zip_name);
 
-    const zip_step = ZipDirStep.create(b, slug_dir_abs, zip_path, slug);
-    zip_step.step.dependOn(&install_lib.step);
-
-    if (!overrode_init) {
-        const install_init = b.addInstallFile(
-            init_path,
-            b.fmt("{s}/__init__.py", .{subdir}),
-        );
-        zip_step.step.dependOn(&install_init.step);
-        top.dependOn(&install_init.step);
-    }
-    if (!overrode_native) {
-        const install_native = b.addInstallFile(
-            dep.path("addon/dvui_native.py"),
-            b.fmt("{s}/dvui_native.py", .{subdir}),
-        );
-        zip_step.step.dependOn(&install_native.step);
-        top.dependOn(&install_native.step);
-    }
-    if (!overrode_overlay) {
-        const install_overlay = b.addInstallFile(
-            dep.path("addon/overlay.py"),
-            b.fmt("{s}/overlay.py", .{subdir}),
-        );
-        zip_step.step.dependOn(&install_overlay.step);
-        top.dependOn(&install_overlay.step);
-    }
-
-    for (opts.extra_files) |ef| {
-        const install_extra = b.addInstallFile(
-            ef.source,
-            b.fmt("{s}/{s}", .{ subdir, ef.name }),
-        );
-        zip_step.step.dependOn(&install_extra.step);
-        top.dependOn(&install_extra.step);
-    }
-
-    top.dependOn(&zip_step.step);
+    const install_zip = b.addInstallFile(zip, b.fmt("{s}/{s}", .{ opts.install_root, zip_name }));
+    install_zip.step.dependOn(&install_dir.step);
 
     return .{
-        .step = top,
+        .step = &install_zip.step,
         .lib = lib,
         .install_subdir = subdir,
         .slug = slug,
-        .zip_path = zip_path,
+        .zip = zip,
     };
+}
+
+fn isOverridden(extra_files: []const ExtraFile, name: []const u8) bool {
+    for (extra_files) |ef| {
+        if (std.mem.eql(u8, ef.name, name)) return true;
+    }
+    return false;
 }
 
 fn slugify(b: *std.Build, name: []const u8) []const u8 {
@@ -355,194 +339,4 @@ fn slugify(b: *std.Build, name: []const u8) []const u8 {
         return prefixed;
     }
     return buf[0..len];
-}
-
-/// Custom build step that bundles a directory into a zip archive.
-///
-/// Uses the "stored" (no compression) ZIP method, which keeps the
-/// implementation small while still producing a file that Blender's
-/// addon installer accepts. Output is deterministic: entries are
-/// sorted by name and timestamps are pinned to 1980-01-01.
-const ZipDirStep = struct {
-    step: std.Build.Step,
-    source_dir_abs: []const u8,
-    output_path_abs: []const u8,
-    top_name: []const u8,
-
-    fn create(
-        b: *std.Build,
-        source_dir_abs: []const u8,
-        output_path_abs: []const u8,
-        top_name: []const u8,
-    ) *ZipDirStep {
-        const self = b.allocator.create(ZipDirStep) catch @panic("OOM");
-        self.* = .{
-            .step = std.Build.Step.init(.{
-                .id = .custom,
-                .name = b.fmt("zip {s}", .{std.fs.path.basename(output_path_abs)}),
-                .owner = b,
-                .makeFn = make,
-            }),
-            .source_dir_abs = source_dir_abs,
-            .output_path_abs = output_path_abs,
-            .top_name = top_name,
-        };
-        return self;
-    }
-
-    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
-        _ = options;
-        const self: *ZipDirStep = @fieldParentPtr("step", step);
-        try writeZipOfDir(
-            step.owner.graph.io,
-            step.owner.allocator,
-            self.source_dir_abs,
-            self.output_path_abs,
-            self.top_name,
-        );
-    }
-};
-
-const ZipEntry = struct {
-    /// Path as it appears inside the zip, with `/` separators.
-    /// Directories have a trailing `/`.
-    name: []u8,
-    kind: enum { file, dir },
-    data: []u8,
-    crc: u32,
-    local_header_offset: u32 = 0,
-};
-
-fn writeZipOfDir(
-    io: std.Io,
-    alloc: std.mem.Allocator,
-    source_dir_abs: []const u8,
-    output_path_abs: []const u8,
-    top_name: []const u8,
-) !void {
-    var src = try std.Io.Dir.cwd().openDir(io, source_dir_abs, .{ .iterate = true });
-    defer src.close(io);
-
-    var entries: std.ArrayList(ZipEntry) = .empty;
-    defer {
-        for (entries.items) |e| {
-            alloc.free(e.name);
-            alloc.free(e.data);
-        }
-        entries.deinit(alloc);
-    }
-
-    try entries.append(alloc, .{
-        .name = try std.fmt.allocPrint(alloc, "{s}/", .{top_name}),
-        .kind = .dir,
-        .data = &.{},
-        .crc = 0,
-    });
-
-    var walker = try src.walk(alloc);
-    defer walker.deinit();
-    while (try walker.next(io)) |entry| {
-        switch (entry.kind) {
-            .directory => {
-                try entries.append(alloc, .{
-                    .name = try std.fmt.allocPrint(alloc, "{s}/{s}/", .{ top_name, entry.path }),
-                    .kind = .dir,
-                    .data = &.{},
-                    .crc = 0,
-                });
-            },
-            .file => {
-                const data = try src.readFileAlloc(io, entry.path, alloc, .unlimited);
-                try entries.append(alloc, .{
-                    .name = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ top_name, entry.path }),
-                    .kind = .file,
-                    .data = data,
-                    .crc = std.hash.Crc32.hash(data),
-                });
-            },
-            else => {},
-        }
-    }
-
-    std.mem.sort(ZipEntry, entries.items, {}, struct {
-        fn lt(_: void, a: ZipEntry, b: ZipEntry) bool {
-            return std.mem.lessThan(u8, a.name, b.name);
-        }
-    }.lt);
-
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-
-    // Local file headers + data.
-    for (entries.items) |*e| {
-        e.local_header_offset = @intCast(buf.items.len);
-        try writeU32Le(alloc, &buf, 0x04034b50); // local file header signature
-        try writeU16Le(alloc, &buf, 20); // version needed
-        try writeU16Le(alloc, &buf, 0); // flags
-        try writeU16Le(alloc, &buf, 0); // method = stored
-        try writeU16Le(alloc, &buf, 0); // dos time (00:00:00)
-        try writeU16Le(alloc, &buf, 0x0021); // dos date (1980-01-01)
-        try writeU32Le(alloc, &buf, e.crc);
-        try writeU32Le(alloc, &buf, @intCast(e.data.len)); // compressed
-        try writeU32Le(alloc, &buf, @intCast(e.data.len)); // uncompressed
-        try writeU16Le(alloc, &buf, @intCast(e.name.len));
-        try writeU16Le(alloc, &buf, 0); // extra field length
-        try buf.appendSlice(alloc, e.name);
-        try buf.appendSlice(alloc, e.data);
-    }
-
-    // Central directory.
-    const cd_offset: u32 = @intCast(buf.items.len);
-    for (entries.items) |e| {
-        try writeU32Le(alloc, &buf, 0x02014b50); // central directory signature
-        try writeU16Le(alloc, &buf, 0x031e); // version made by: unix, zip 3.0
-        try writeU16Le(alloc, &buf, 20); // version needed
-        try writeU16Le(alloc, &buf, 0); // flags
-        try writeU16Le(alloc, &buf, 0); // method
-        try writeU16Le(alloc, &buf, 0); // time
-        try writeU16Le(alloc, &buf, 0x0021); // date
-        try writeU32Le(alloc, &buf, e.crc);
-        try writeU32Le(alloc, &buf, @intCast(e.data.len));
-        try writeU32Le(alloc, &buf, @intCast(e.data.len));
-        try writeU16Le(alloc, &buf, @intCast(e.name.len));
-        try writeU16Le(alloc, &buf, 0); // extra field length
-        try writeU16Le(alloc, &buf, 0); // comment length
-        try writeU16Le(alloc, &buf, 0); // disk number
-        try writeU16Le(alloc, &buf, 0); // internal attrs
-        // External attrs: unix mode in upper 16 bits, DOS attrs in lower.
-        const ext_attrs: u32 = switch (e.kind) {
-            .dir => (@as(u32, 0o040755) << 16) | 0x10,
-            .file => (@as(u32, 0o100644) << 16),
-        };
-        try writeU32Le(alloc, &buf, ext_attrs);
-        try writeU32Le(alloc, &buf, e.local_header_offset);
-        try buf.appendSlice(alloc, e.name);
-    }
-    const cd_size: u32 = @as(u32, @intCast(buf.items.len)) - cd_offset;
-
-    // End of central directory record.
-    try writeU32Le(alloc, &buf, 0x06054b50);
-    try writeU16Le(alloc, &buf, 0); // this disk
-    try writeU16Le(alloc, &buf, 0); // disk where CD starts
-    try writeU16Le(alloc, &buf, @intCast(entries.items.len));
-    try writeU16Le(alloc, &buf, @intCast(entries.items.len));
-    try writeU32Le(alloc, &buf, cd_size);
-    try writeU32Le(alloc, &buf, cd_offset);
-    try writeU16Le(alloc, &buf, 0); // comment length
-
-    var out = try std.Io.Dir.cwd().createFile(io, output_path_abs, .{ .truncate = true });
-    defer out.close(io);
-    try out.writeStreamingAll(io, buf.items);
-}
-
-fn writeU16Le(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), v: u16) !void {
-    var tmp: [2]u8 = undefined;
-    std.mem.writeInt(u16, &tmp, v, .little);
-    try buf.appendSlice(alloc, &tmp);
-}
-
-fn writeU32Le(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), v: u32) !void {
-    var tmp: [4]u8 = undefined;
-    std.mem.writeInt(u32, &tmp, v, .little);
-    try buf.appendSlice(alloc, &tmp);
 }

@@ -65,12 +65,11 @@ export fn dvui_create(width: u32, height: u32) ?*Ctx {
         dvui.current_window = &ctx.window;
         defer dvui.current_window = prev_current;
 
-        const res: anyerror!void = if (init_info.params.len == 1)
+        const res: anyerror!void = if (init_info.param_types.len == 1)
             app.init(&ctx.window)
-        else if (init_info.params.len == 0)
+        else if (init_info.param_types.len == 0)
             app.init()
-        else
-            {};
+        else {};
 
         res catch |err| {
             std.log.err("dvui app init failed: {}", .{err});
@@ -199,13 +198,37 @@ pub const KeyCode = enum(c_int) {
     right_control = 23,
     left_alt = 24,
     right_alt = 25,
-    a = 100, b, c, d, e, f, g, h, i, j, k, l, m,
-    n, o, p, q, r, s, t, u, v, w, x, y, z,
+    a = 100,
+    b,
+    c,
+    d,
+    e,
+    f,
+    g,
+    h,
+    i,
+    j,
+    k,
+    l,
+    m,
+    n,
+    o,
+    p,
+    q,
+    r,
+    s,
+    t,
+    u,
+    v,
+    w,
+    x,
+    y,
+    z,
     _,
 };
 
 fn mapKeyCode(code: c_int) ?dvui.enums.Key {
-    const k: KeyCode = @enumFromInt(code);
+    const k: KeyCode = @fromBackingInt(@intCast(code));
     return switch (k) {
         .none => null,
         .backspace => .backspace,
@@ -229,11 +252,32 @@ fn mapKeyCode(code: c_int) ?dvui.enums.Key {
         .right_control => .right_control,
         .left_alt => .left_alt,
         .right_alt => .right_alt,
-        .a => .a, .b => .b, .c => .c, .d => .d, .e => .e, .f => .f,
-        .g => .g, .h => .h, .i => .i, .j => .j, .k => .k, .l => .l,
-        .m => .m, .n => .n, .o => .o, .p => .p, .q => .q, .r => .r,
-        .s => .s, .t => .t, .u => .u, .v => .v, .w => .w, .x => .x,
-        .y => .y, .z => .z,
+        .a => .a,
+        .b => .b,
+        .c => .c,
+        .d => .d,
+        .e => .e,
+        .f => .f,
+        .g => .g,
+        .h => .h,
+        .i => .i,
+        .j => .j,
+        .k => .k,
+        .l => .l,
+        .m => .m,
+        .n => .n,
+        .o => .o,
+        .p => .p,
+        .q => .q,
+        .r => .r,
+        .s => .s,
+        .t => .t,
+        .u => .u,
+        .v => .v,
+        .w => .w,
+        .x => .x,
+        .y => .y,
+        .z => .z,
         _ => null,
     };
 }
@@ -245,11 +289,11 @@ const C_MOD_CMD: c_int = 1 << 3;
 
 fn mapMod(mods: c_int) dvui.enums.Mod {
     var out: u16 = 0;
-    if (mods & C_MOD_SHIFT != 0) out |= @intFromEnum(dvui.enums.Mod.lshift);
-    if (mods & C_MOD_CTRL != 0) out |= @intFromEnum(dvui.enums.Mod.lcontrol);
-    if (mods & C_MOD_ALT != 0) out |= @intFromEnum(dvui.enums.Mod.lalt);
-    if (mods & C_MOD_CMD != 0) out |= @intFromEnum(dvui.enums.Mod.lcommand);
-    return @enumFromInt(out);
+    if (mods & C_MOD_SHIFT != 0) out |= @backingInt(dvui.enums.Mod.lshift);
+    if (mods & C_MOD_CTRL != 0) out |= @backingInt(dvui.enums.Mod.lcontrol);
+    if (mods & C_MOD_ALT != 0) out |= @backingInt(dvui.enums.Mod.lalt);
+    if (mods & C_MOD_CMD != 0) out |= @backingInt(dvui.enums.Mod.lcommand);
+    return @fromBackingInt(@intCast(out));
 }
 
 /// `pressed`: 0 = up, 1 = down, 2 = repeat. Returns 1 if dvui handled.
@@ -287,7 +331,7 @@ export fn dvui_text_input_active(ctx: *Ctx) c_int {
 ///   5=arrow_nw_se 6=arrow_ne_sw 7=arrow_w_e 8=arrow_n_s
 ///   9=arrow_all 10=bad 11=hand 12=hidden
 export fn dvui_cursor_requested(ctx: *Ctx) c_int {
-    return @intFromEnum(ctx.window.cursorRequested());
+    return @backingInt(ctx.window.cursorRequested());
 }
 
 /// Tell DVUI that text from `start` to `end` should be selected in the

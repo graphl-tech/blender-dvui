@@ -32,7 +32,7 @@ the GL context.
 
 ## Prerequisites
 
-- Zig 0.15.2+
+- Zig 0.17.0+
 - Blender 4.x or 5.x (tested on 5.1.1)
 - Linux (tested). macOS/Windows not yet exercised; the ctypes loader
   picks the right `dylib`/`dll` suffix but nothing else has been verified
@@ -45,6 +45,9 @@ zig build
 
 This produces `zig-out/lib/libblender_dvui.so` (the addon resolves it
 via `BLENDER_DVUI_LIB` env var or by falling back to that path).
+
+`zig build blender-addon` packages the sample app through
+`buildBlenderAddon` into `zig-out/blender_addon/`.
 
 ## Run inside Blender
 
@@ -223,7 +226,8 @@ pub fn build(b: *std.Build) void {
 `buildBlenderAddon` returns a `BlenderAddon` whose `.step` is the
 top-level step that triggers cdylib + Python file installation, and
 `.lib` is the cdylib `Compile` step (handy if you need to add C
-sources, link extra system libraries, etc.).
+sources, link extra system libraries, etc.), and `.zip` is the zip as a
+`LazyPath`.
 
 `build.zig.zon` should pull in both `dvui` (with the same hash this
 repo uses; see `build.zig.zon`) and `blender_dvui` (path or url):
